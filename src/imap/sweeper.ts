@@ -15,6 +15,15 @@ export type SweepOptions = {
   onEmail: (email: NormalizedEmail) => Promise<void>;
 };
 
+export type SweepResult = {
+  foldersChecked: number;
+  failures: { folder: string; message: string }[];
+};
+
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
 async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): Promise<void> {
   const current = await deps.status(path);
   const previous = opts.store.getFolderState(opts.accountLabel, path);
@@ -26,8 +35,24 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
     return;
   }
 
-  if (current.uidNext <= previous.uidNext) return;
+  // uidNext moving backward without a uidValidity change means a mailbox
+  // restore or a non-compliant server reset the high-water mark under us.
+  // Trusting the old (higher) value would silently drop all future mail in
+  // this folder forever, so re-baseline here too and self-heal in one sweep.
+  if (current.uidNext < previous.uidNext) {
+    console.error(
+      `[${opts.accountLabel}] folder ${path}: uidNext moved backward (${previous.uidNext} -> ${current.uidNext}); re-baselining`
+    );
+    opts.store.setFolderState(opts.accountLabel, path, current);
+    return;
+  }
 
+  if (current.uidNext === previous.uidNext) return;
+
+  // fetchSince uses previous.uidNext only as a floor. A message that arrives
+  // between status() and fetchSince() may be included here and again in the
+  // next sweep's fetch; that overlap is intentional and harmless because
+  // hasSeen/markSeen dedup on messageId, so it is never notified twice.
   const messages = await deps.fetchSince(path, previous.uidNext);
   messages.sort((a, b) => a.uid - b.uid);
 
@@ -38,24 +63,36 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
       previewChars: opts.previewChars,
     });
 
-    if (!opts.store.markSeen(email.messageId)) continue; // already notified elsewhere
+    if (opts.store.hasSeen(email.messageId)) continue; // already notified elsewhere
+
+    // Mark seen only after the send succeeds. This accepts at-least-once
+    // delivery (a crash between onEmail resolving and markSeen committing
+    // yields one duplicate on restart) in exchange for never losing a
+    // notification: if onEmail throws, the id stays unmarked and folder
+    // state stays unadvanced, so this exact message is retried next sweep.
     await opts.onEmail(email);
+    opts.store.markSeen(email.messageId);
   }
 
   // Only advance once the whole batch is handled, so a crash mid-batch retries.
   opts.store.setFolderState(opts.accountLabel, path, current);
 }
 
-export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<void> {
+export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult> {
   const folders = await deps.list();
+  const failures: { folder: string; message: string }[] = [];
+  let foldersChecked = 0;
 
   for (const folder of folders) {
     try {
       await sweepFolder(deps, opts, folder.path);
+      foldersChecked++;
     } catch (err) {
-      console.error(
-        `[${opts.accountLabel}] sweep failed for folder ${folder.path}: ${(err as Error).message}`
-      );
+      const message = errorMessage(err);
+      console.error(`[${opts.accountLabel}] sweep failed for folder ${folder.path}: ${message}`);
+      failures.push({ folder: folder.path, message });
     }
   }
+
+  return { foldersChecked, failures };
 }

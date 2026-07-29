@@ -160,11 +160,12 @@ describe('sweep', () => {
     folders.INBOX.uidNext = 11;
     folders.INBOX.messages = [{ uid: 10, source: eml('boom', 'Boom') }];
 
-    await expect(sweep(deps, makeOpts(async () => { throw new Error('telegram down'); }))).resolves.toBeUndefined();
+    const result = await sweep(deps, makeOpts(async () => { throw new Error('telegram down'); }));
+    expect(result.failures).toEqual([{ folder: 'INBOX', message: 'telegram down' }]);
     expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(10);
   });
 
-  it('continues to other folders when one folder fails', async () => {
+  it('continues to other folders when one folder fails, and reports the failure in the result', async () => {
     const deps: SweepDeps = {
       async list() {
         return [{ path: 'Broken' }, { path: 'Fine' }];
@@ -179,9 +180,92 @@ describe('sweep', () => {
     };
     const onEmail = vi.fn(async () => {});
 
-    await sweep(deps, makeOpts(onEmail));
+    const result = await sweep(deps, makeOpts(onEmail));
 
     expect(store.getFolderState('Work', 'Fine')).toEqual({ uidNext: 4, uidValidity: 1 });
     expect(store.getFolderState('Work', 'Broken')).toBeNull();
+    expect(result.foldersChecked).toBe(1);
+    expect(result.failures).toEqual([{ folder: 'Broken', message: 'NO permission denied' }]);
+  });
+
+  it('delivers a message on retry after a failed send, without re-delivering messages already handled in the same batch', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps } = makeDeps(folders);
+
+    await sweep(deps, makeOpts(async () => {}));
+
+    folders.INBOX.uidNext = 12;
+    folders.INBOX.messages = [
+      { uid: 10, source: eml('ok', 'Delivered first') },
+      { uid: 11, source: eml('boom', 'Fails first time') },
+    ];
+
+    const delivered: string[] = [];
+    let shouldThrow = true;
+    const onEmail = vi.fn(async (email: NormalizedEmail) => {
+      if (email.subject === 'Fails first time' && shouldThrow) {
+        throw new Error('telegram down');
+      }
+      delivered.push(email.subject);
+    });
+
+    await sweep(deps, makeOpts(onEmail));
+    expect(delivered).toEqual(['Delivered first']);
+    // State must not have advanced, since the batch didn't fully succeed.
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(10);
+
+    shouldThrow = false;
+    await sweep(deps, makeOpts(onEmail));
+
+    // The previously-failed message is now delivered; the already-delivered
+    // one is not delivered a second time.
+    expect(delivered).toEqual(['Delivered first', 'Fails first time']);
+    expect(store.getFolderState('Work', 'INBOX')).toEqual({ uidNext: 12, uidValidity: 1 });
+  });
+
+  it('re-baselines and self-heals when uidNext moves backward without a uidValidity change', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps, fetchCalls } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail));
+
+    // Mailbox restore / non-compliant server: uidNext drops without uidValidity changing.
+    folders.INBOX.uidNext = 4;
+    folders.INBOX.messages = [{ uid: 3, source: eml('restored', 'Restored') }];
+
+    await sweep(deps, makeOpts(onEmail));
+
+    expect(onEmail).not.toHaveBeenCalled();
+    expect(fetchCalls).toHaveLength(0);
+    expect(store.getFolderState('Work', 'INBOX')).toEqual({ uidNext: 4, uidValidity: 1 });
+
+    // The folder should now behave normally against the new baseline.
+    folders.INBOX.uidNext = 5;
+    folders.INBOX.messages.push({ uid: 4, source: eml('after-heal', 'After heal') });
+    await sweep(deps, makeOpts(onEmail));
+
+    expect(onEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('fetches from exactly the stored uidNext floor', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps, fetchCalls } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail));
+
+    folders.INBOX.uidNext = 15;
+    folders.INBOX.messages = [{ uid: 10, source: eml('x', 'X') }];
+    await sweep(deps, makeOpts(onEmail));
+
+    expect(fetchCalls).toHaveLength(1);
+    expect(fetchCalls[0]!.uidFrom).toBe(10);
   });
 });
