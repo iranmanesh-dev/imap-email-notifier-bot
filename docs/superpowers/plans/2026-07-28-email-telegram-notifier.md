@@ -689,7 +689,7 @@ Two responsibilities that share one database file: `Message-ID` deduplication, a
   - `class SeenStore` with:
     - `constructor(dbPath: string)`
     - `hasSeen(messageId: string): boolean`
-    - `markSeen(messageId: string): boolean` — returns `true` if newly inserted, `false` if already present
+    - `markSeen(messageId: string, firstSeenAt?: string): boolean` — returns `true` if newly inserted, `false` if already present. `firstSeenAt` is an optional SQLite datetime string; it exists so tests can create backdated rows without reaching into the database.
     - `getFolderState(accountLabel: string, folder: string): FolderState | null`
     - `setFolderState(accountLabel: string, folder: string, state: FolderState): void`
     - `prune(olderThanDays: number): number` — returns rows deleted
@@ -777,15 +777,21 @@ describe('prune', () => {
     expect(store.hasSeen('<a@x>')).toBe(true);
   });
 
-  it('deletes entries older than the cutoff', () => {
-    store.markSeen('<old@x>');
-    // Backdate the row by 40 days.
-    store.rawForTests().prepare(
-      "UPDATE seen SET first_seen_at = datetime('now', '-40 days') WHERE message_id = ?"
-    ).run('<old@x>');
+  /** SQLite datetime string (`YYYY-MM-DD HH:MM:SS`) for N days before now. */
+  function daysAgo(days: number): string {
+    return new Date(Date.now() - days * 86_400_000).toISOString().replace('T', ' ').slice(0, 19);
+  }
 
+  it('deletes entries older than the cutoff', () => {
+    store.markSeen('<old@x>', daysAgo(40));
     expect(store.prune(30)).toBe(1);
     expect(store.hasSeen('<old@x>')).toBe(false);
+  });
+
+  it('keeps entries just inside the cutoff', () => {
+    store.markSeen('<recent@x>', daysAgo(29));
+    expect(store.prune(30)).toBe(0);
+    expect(store.hasSeen('<recent@x>')).toBe(true);
   });
 });
 ```
@@ -835,10 +841,18 @@ export class SeenStore {
     return row !== undefined;
   }
 
-  markSeen(messageId: string): boolean {
-    const info = this.#db
-      .prepare('INSERT OR IGNORE INTO seen (message_id) VALUES (?)')
-      .run(messageId);
+  /**
+   * Records a message id as notified. Returns true if it was newly inserted.
+   * `firstSeenAt` (a bound `YYYY-MM-DD HH:MM:SS` value) lets tests create
+   * backdated rows; production callers omit it.
+   */
+  markSeen(messageId: string, firstSeenAt?: string): boolean {
+    const info =
+      firstSeenAt === undefined
+        ? this.#db.prepare('INSERT OR IGNORE INTO seen (message_id) VALUES (?)').run(messageId)
+        : this.#db
+            .prepare('INSERT OR IGNORE INTO seen (message_id, first_seen_at) VALUES (?, ?)')
+            .run(messageId, firstSeenAt);
     return info.changes > 0;
   }
 
@@ -869,11 +883,6 @@ export class SeenStore {
     return info.changes;
   }
 
-  /** Escape hatch for tests that need to backdate rows. Not for production use. */
-  rawForTests(): Database.Database {
-    return this.#db;
-  }
-
   close(): void {
     this.#db.close();
   }
@@ -883,7 +892,7 @@ export class SeenStore {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run test/seen.test.ts`
-Expected: PASS, 10 tests.
+Expected: PASS, 11 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1536,9 +1545,11 @@ const account: Account = {
 };
 
 describe('createClient', () => {
-  it('builds a client for the account host and port', () => {
+  it('returns a client exposing every ImapFlow method this codebase relies on', () => {
     const client = createClient(account);
-    expect(client).toBeDefined();
+    for (const method of ['connect', 'list', 'status', 'getMailboxLock', 'fetch', 'mailboxOpen', 'noop', 'logout']) {
+      expect(typeof (client as unknown as Record<string, unknown>)[method]).toBe('function');
+    }
   });
 });
 
