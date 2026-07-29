@@ -628,7 +628,7 @@ function collapse(text: string): string {
 }
 
 function syntheticId(parts: string[]): string {
-  const hash = createHash('sha256').update(parts.join(' ')).digest('hex');
+  const hash = createHash('sha256').update(parts.join('|')).digest('hex');
   return `synthetic:${hash}`;
 }
 
