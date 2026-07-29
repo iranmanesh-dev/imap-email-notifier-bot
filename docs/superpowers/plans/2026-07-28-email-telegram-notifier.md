@@ -1226,7 +1226,13 @@ The heart of the design. Lists folders, checks `UIDNEXT` and `UIDVALIDITY` via `
 - Produces:
   - `type SweepDeps = { list(): Promise<{ path: string }[]>; status(path: string): Promise<{ uidNext: number; uidValidity: number }>; fetchSince(path: string, uidFrom: number): Promise<{ uid: number; source: Buffer }[]> }`
   - `type SweepOptions = { accountLabel: string; previewChars: number; store: SeenStore; onEmail: (email: NormalizedEmail) => Promise<void> }`
-  - `function sweep(deps: SweepDeps, opts: SweepOptions): Promise<void>`
+  - `type SweepResult = { foldersChecked: number; failures: { folder: string; message: string }[] }` — `foldersChecked` counts SUCCESSFULLY swept folders only, excluding `failures`
+  - `function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult>`
+
+> **Corrected during execution.** Two defects in this task's originally-written code were found in review and fixed; the shipped `src/imap/sweeper.ts` is authoritative where it differs from the snippets below.
+> 1. **Ordering (Critical).** The original gated notification on `markSeen`, which marked the id *before* `onEmail`. A failed send then held folder state for a retry that skipped the already-marked message — losing it permanently. Shipped code gates on `hasSeen` and calls `markSeen` only after `onEmail` resolves. This makes delivery **at-least-once**: a SIGKILL between send and mark yields one duplicate on restart. That is the accepted trade — a duplicate is acceptable, a silent loss is not.
+> 2. **Backward `uidNext` (Important).** The original `current.uidNext <= previous.uidNext` early return kept a stale high-water mark, silently dropping all future mail in a folder whose `UIDNEXT` moved backward without a `UIDVALIDITY` change. Shipped code re-baselines on `<` and no-ops on `==`.
+> 3. **Error signalling (Important).** `sweep` returned `void` and swallowed per-folder errors, so a caller could not tell that every folder had failed. It now returns `SweepResult`. Errors from `deps.list()` still propagate — that is the dead-connection signal.
 
 `SweepDeps` is a narrow interface over ImapFlow rather than ImapFlow itself, so this module is testable with a fake and Task 8 supplies the real adapter.
 
@@ -1474,15 +1480,18 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
       previewChars: opts.previewChars,
     });
 
-    if (!opts.store.markSeen(email.messageId)) continue; // already notified elsewhere
+    // Gate on hasSeen and mark only AFTER a successful send, so a failed send
+    // retries instead of being skipped as already-seen. At-least-once by design.
+    if (opts.store.hasSeen(email.messageId)) continue; // already notified elsewhere
     await opts.onEmail(email);
+    opts.store.markSeen(email.messageId);
   }
 
   // Only advance once the whole batch is handled, so a crash mid-batch retries.
   opts.store.setFolderState(opts.accountLabel, path, current);
 }
 
-export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<void> {
+export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult> {
   const folders = await deps.list();
 
   for (const folder of folders) {
