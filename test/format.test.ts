@@ -73,4 +73,47 @@ describe('formatEmail', () => {
     expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
     expect(out).not.toMatch(/&(a(m(p)?)?)?$|&l(t)?$|&g(t)?$/);
   });
+
+  it('bounds a very long subject to stay under the limit', () => {
+    const out = formatEmail(makeEmail({ subject: 'A'.repeat(4200) }));
+    expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+  });
+
+  it('bounds a long subject made entirely of ampersands (5x expansion)', () => {
+    const out = formatEmail(makeEmail({ subject: '&'.repeat(1000) }));
+    expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+  });
+
+  it('bounds a very long from field', () => {
+    const out = formatEmail(makeEmail({ from: 'B'.repeat(5000) }));
+    expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+  });
+
+  it('bounds a very long folder', () => {
+    const out = formatEmail(makeEmail({ folder: 'C'.repeat(5000) }));
+    expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+  });
+
+  it('does not truncate a normal short subject', () => {
+    const email = makeEmail({ subject: 'Normal subject here' });
+    const out = formatEmail(email);
+    expect(out).toContain('Normal subject here');
+    expect(out).not.toMatch(/<b>Normal subject here…/);
+  });
+
+  it('never ends with a partial HTML entity', () => {
+    const longSubject = 'A'.repeat(4200);
+    const longFrom = 'B'.repeat(5000);
+    const longFolder = 'C'.repeat(5000);
+    const out = formatEmail(
+      makeEmail({
+        subject: longSubject,
+        from: longFrom,
+        folder: longFolder,
+        preview: 'x'.repeat(1000),
+      })
+    );
+    expect(out.length).toBeLessThanOrEqual(TELEGRAM_MAX_CHARS);
+    expect(out).not.toMatch(/&(a(m(p)?)?)?$|&l(t)?$|&g(t)?$/);
+  });
 });
