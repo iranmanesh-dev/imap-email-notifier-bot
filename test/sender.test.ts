@@ -104,6 +104,40 @@ describe('TelegramSender', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  it('performs the mandatory 400 plain-text retry even when maxAttempts is 1', async () => {
+    const calls: RequestInit[] = [];
+    let call = 0;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      calls.push(init);
+      call += 1;
+      if (call === 1) return jsonResponse(400, { ok: false, description: "can't parse entities" });
+      return jsonResponse(200, { ok: true });
+    });
+    const sender = makeSender(fetchMock as unknown as typeof fetch, { maxAttempts: 1 });
+
+    expect(await sender.send('<b>broken')).toBe('sent');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+
+    const second = JSON.parse(calls[1]!.body as string);
+    expect(second.parse_mode).toBeUndefined();
+  });
+
+  it('drops immediately on 401 without retrying', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(401, { ok: false, description: 'Unauthorized' }));
+    const sender = makeSender(fetchMock as unknown as typeof fetch);
+
+    expect(await sender.send('hi')).toBe('dropped');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('drops immediately on 403 without retrying', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(403, { ok: false, description: 'Forbidden' }));
+    const sender = makeSender(fetchMock as unknown as typeof fetch);
+
+    expect(await sender.send('hi')).toBe('dropped');
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it('serializes concurrent sends in order', async () => {
     const order: string[] = [];
     const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
@@ -118,7 +152,18 @@ describe('TelegramSender', () => {
     expect(order).toEqual(['one', 'two', 'three']);
   });
 
-  it('waits minIntervalMs between sends', async () => {
+  it('does not throttle the first send', async () => {
+    const slept: number[] = [];
+    const sender = makeSender(
+      (async () => jsonResponse(200, { ok: true })) as unknown as typeof fetch,
+      { minIntervalMs: 1000, sleep: async (ms: number) => { slept.push(ms); } }
+    );
+
+    await sender.send('one');
+    expect(slept).toHaveLength(0);
+  });
+
+  it('throttles the second send to approximately minIntervalMs', async () => {
     const slept: number[] = [];
     const sender = makeSender(
       (async () => jsonResponse(200, { ok: true })) as unknown as typeof fetch,
@@ -127,7 +172,38 @@ describe('TelegramSender', () => {
 
     await sender.send('one');
     await sender.send('two');
-    expect(slept.some((ms) => ms > 0)).toBe(true);
+
+    expect(slept).toHaveLength(1);
+    expect(slept[0]).toBeGreaterThan(900);
+    expect(slept[0]).toBeLessThanOrEqual(1000);
+  });
+
+  it('does not throttle when minIntervalMs has already elapsed', async () => {
+    const slept: number[] = [];
+    const sender = makeSender(
+      (async () => jsonResponse(200, { ok: true })) as unknown as typeof fetch,
+      { minIntervalMs: 10, sleep: async (ms: number) => { slept.push(ms); } }
+    );
+
+    await sender.send('one');
+    await new Promise((r) => setTimeout(r, 20));
+    await sender.send('two');
+
+    expect(slept).toHaveLength(0);
+  });
+
+  it('disables throttling entirely when minIntervalMs is 0', async () => {
+    const slept: number[] = [];
+    const sender = makeSender(
+      (async () => jsonResponse(200, { ok: true })) as unknown as typeof fetch,
+      { minIntervalMs: 0, sleep: async (ms: number) => { slept.push(ms); } }
+    );
+
+    await sender.send('one');
+    await sender.send('two');
+    await sender.send('three');
+
+    expect(slept).toHaveLength(0);
   });
 
   it('drops on a network error after exhausting attempts', async () => {

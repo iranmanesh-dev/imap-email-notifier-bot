@@ -106,6 +106,9 @@ export class TelegramSender {
         plainRetryUsed = true;
         text = toPlainText(html);
         useHtml = false;
+        // The mandatory plain-text retry must not consume the maxAttempts
+        // budget, so cancel out the loop's `attempt += 1` for this pass.
+        attempt -= 1;
         continue;
       }
 
