@@ -69,4 +69,33 @@ describe('parseEmail', () => {
     expect(email.subject).toBe('');
     expect(email.messageId).toMatch(/^synthetic:/);
   });
+
+  it('extracts the preview from the plaintext part of a multipart/alternative message', async () => {
+    const email = await parseEmail(fixture('multipart-alternative.eml'), ctx);
+    expect(email.preview).toContain('real plaintext content');
+    expect(email.preview).not.toContain('HTML-rendered content only');
+  });
+
+  it('keeps the same synthetic id across parses when both Message-ID and Date are absent', async () => {
+    const buf = fixture('no-message-id-no-date.eml');
+    const a = await parseEmail(buf, ctx);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    const b = await parseEmail(buf, ctx);
+    expect(a.messageId).toBe(b.messageId);
+    expect(a.messageId).toMatch(/^synthetic:[0-9a-f]{64}$/);
+  });
+
+  it('does not produce a lone surrogate when a preview boundary lands mid-emoji', async () => {
+    const email = await parseEmail(fixture('emoji-boundary.eml'), { ...ctx, previewChars: 3 });
+    expect(email.preview.length).toBeLessThanOrEqual(3);
+    expect(() => encodeURIComponent(email.preview)).not.toThrow();
+  });
+
+  it('strips <style> and <script> content from HTML-only bodies', async () => {
+    const email = await parseEmail(fixture('html-with-style-script.eml'), ctx);
+    expect(email.preview).toContain('Important update');
+    expect(email.preview).toContain('Please read this');
+    expect(email.preview).not.toContain('color: red');
+    expect(email.preview).not.toContain('alert(');
+  });
 });

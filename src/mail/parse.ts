@@ -19,8 +19,37 @@ function collapse(text: string): string {
   return text.replace(/\s+/g, ' ').trim();
 }
 
-function syntheticId(parts: string[]): string {
-  const hash = createHash('sha256').update(parts.join('|')).digest('hex');
+// Truncates on whole Unicode code points so the boundary can never land inside
+// a surrogate pair (e.g. an emoji), which would otherwise leave a lone
+// surrogate and produce a corrupt string.
+function truncateCodePoints(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let result = '';
+  for (const char of text) {
+    if (result.length + char.length > maxChars) break;
+    result += char;
+  }
+  return result;
+}
+
+// The dedup key must be a pure function of the message bytes and the parse
+// context - never wall-clock time. If a retry re-parses the identical buffer
+// (e.g. after a failed onEmail handler leaves folder state unadvanced), the
+// same key must come out, or the message would be notified again on every
+// retry. Hashing the raw source buffer together with accountLabel (rather
+// than joining decoded header strings with a plain delimiter) also removes
+// any field-boundary ambiguity: the two inputs are hashed as fixed-length
+// prefixed segments so no choice of accountLabel or message bytes can shift
+// a boundary and produce a collision.
+function syntheticId(source: Buffer, accountLabel: string): string {
+  const labelBuf = Buffer.from(accountLabel, 'utf8');
+  const lengthPrefix = Buffer.alloc(4);
+  lengthPrefix.writeUInt32BE(labelBuf.length, 0);
+  const hash = createHash('sha256')
+    .update(lengthPrefix)
+    .update(labelBuf)
+    .update(source)
+    .digest('hex');
   return `synthetic:${hash}`;
 }
 
@@ -32,10 +61,9 @@ export async function parseEmail(source: Buffer, ctx: ParseContext): Promise<Nor
   const date = parsed.date ?? new Date();
 
   const body = parsed.text || (parsed.html ? stripHtml(parsed.html) : '');
-  const preview = collapse(body).slice(0, ctx.previewChars);
+  const preview = truncateCodePoints(collapse(body), ctx.previewChars);
 
-  const messageId =
-    parsed.messageId ?? syntheticId([ctx.accountLabel, from, subject, date.toISOString()]);
+  const messageId = parsed.messageId ?? syntheticId(source, ctx.accountLabel);
 
   return {
     messageId,

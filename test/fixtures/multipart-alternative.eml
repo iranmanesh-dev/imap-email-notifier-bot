@@ -1,0 +1,18 @@
+From: Alice Smith <alice@example.com>
+To: me@example.com
+Subject: Multipart alternative test
+Message-ID: <multipart-001@example.com>
+Date: Tue, 28 Jul 2026 14:00:00 +0000
+Content-Type: multipart/alternative; boundary="BOUNDARY"
+
+--BOUNDARY
+Content-Type: text/plain; charset=utf-8
+
+This is the real plaintext content, not the html fallback.
+
+--BOUNDARY
+Content-Type: text/html; charset=utf-8
+
+<html><body><p>This is HTML-rendered content only.</p></body></html>
+
+--BOUNDARY--
