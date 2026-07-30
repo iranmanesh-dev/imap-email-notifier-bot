@@ -79,7 +79,42 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
     // notification: if onEmail throws, the id stays unmarked and folder
     // state stays unadvanced, so this exact message is retried next sweep.
     await opts.onEmail(email);
-    opts.store.markSeen(opts.accountLabel, email.messageId);
+
+    try {
+      opts.store.markSeen(opts.accountLabel, email.messageId);
+    } catch (err) {
+      // A markSeen throw (SQLITE_FULL, read-only volume, corruption) must
+      // NOT be treated like an onEmail failure: hasSeen is a plain SELECT
+      // that keeps succeeding, so leaving folder state unadvanced would mean
+      // this exact message is refetched, resent, and fails to mark seen
+      // again on every future sweep forever — an unbounded duplicate-
+      // notification storm even though the notification itself already went
+      // out. Escalate instead: advance folder state past exactly this
+      // message (never past any later, unprocessed message in the batch) so
+      // it can never be refetched, accepting the loss of its "seen" record
+      // in exchange for a hard stop on repeat sends, then stop this folder
+      // for the rest of this sweep so later messages are left untouched for
+      // a future sweep instead of being fetched-and-discarded now.
+      console.error(
+        `[${opts.accountLabel}] folder ${path}: STORAGE FAILURE marking uid ${message.uid} as seen; the notification was already sent and will not be repeated, but its "seen" record was not persisted: ${errorMessage(err)}`
+      );
+      try {
+        opts.store.setFolderState(opts.accountLabel, path, {
+          uidNext: message.uid + 1,
+          uidValidity: current.uidValidity,
+        });
+      } catch (stateErr) {
+        // Best-effort: if the underlying storage is broken badly enough that
+        // even setFolderState fails, there is nothing more we can do here —
+        // the outer catch below still surfaces the original failure.
+        console.error(
+          `[${opts.accountLabel}] folder ${path}: failed to advance folder state after a markSeen failure: ${errorMessage(stateErr)}`
+        );
+      }
+      throw new Error(
+        `storage failure: unable to mark message as seen in folder ${path} (uid=${message.uid}): ${errorMessage(err)}`
+      );
+    }
   }
 
   // Only advance once the whole batch is handled, so a crash mid-batch retries.

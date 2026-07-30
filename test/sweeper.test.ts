@@ -298,6 +298,99 @@ describe('sweep', () => {
     expect(onEmail).toHaveBeenCalledTimes(2);
   });
 
+  // --- Finding 2: a persistent markSeen failure must not cause an
+  // unbounded duplicate-notification storm ---
+  //
+  // markSeen is a synchronous better-sqlite3 write; if it throws
+  // (SQLITE_FULL, read-only volume, corruption) after onEmail already
+  // resolved, folder state must not simply stay unadvanced — hasSeen would
+  // keep returning false forever, and every following sweep would resend
+  // the same message to Telegram indefinitely. The fix escalates the
+  // failure distinctly and advances folder state past exactly the poisoned
+  // message so it can never be refetched, trading the "seen" record for
+  // that one message for a hard stop on the resend storm.
+
+  it('escalates a persistent markSeen failure instead of resending forever, sending exactly once across several sweeps', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail));
+
+    folders.INBOX.uidNext = 11;
+    folders.INBOX.messages = [{ uid: 10, source: eml('poison', 'Poison') }];
+
+    vi.spyOn(store, 'markSeen').mockImplementation(() => {
+      throw new Error('SQLITE_FULL: database or disk is full');
+    });
+
+    const result1 = await sweep(deps, makeOpts(onEmail));
+    expect(onEmail).toHaveBeenCalledTimes(1);
+    expect(result1.failures).toHaveLength(1);
+    // The failure must be clearly distinguishable from an ordinary onEmail
+    // failure (e.g. "telegram down") so an operator can tell storage is
+    // broken rather than the notification path.
+    expect(result1.failures[0]!.message).toMatch(/storage failure/i);
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(11);
+
+    // Repeated sweeps: the message and the underlying markSeen failure are
+    // both unchanged, but folder state already advanced past uid 10, so
+    // there is nothing left to refetch and no further send happens.
+    await sweep(deps, makeOpts(onEmail));
+    await sweep(deps, makeOpts(onEmail));
+
+    expect(onEmail).toHaveBeenCalledTimes(1);
+  });
+
+  it('stops the folder at the poisoned message but still delivers later messages in the batch once the storage failure clears', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail));
+
+    folders.INBOX.uidNext = 13;
+    folders.INBOX.messages = [
+      { uid: 10, source: eml('first', 'First') },
+      { uid: 11, source: eml('poison', 'Poison') },
+      { uid: 12, source: eml('third', 'Third') },
+    ];
+
+    const realMarkSeen = store.markSeen.bind(store);
+    const spy = vi.spyOn(store, 'markSeen').mockImplementation((accountLabel, messageId) => {
+      if (messageId.includes('poison')) throw new Error('SQLITE_FULL: database or disk is full');
+      return realMarkSeen(accountLabel, messageId);
+    });
+
+    const result = await sweep(deps, makeOpts(onEmail));
+
+    // "First" was delivered and marked seen normally; "Poison" was sent
+    // (onEmail already resolved before markSeen threw) but the folder must
+    // stop there — "Third" is left untouched for a later sweep rather than
+    // being fetched-and-discarded.
+    const subjects = onEmail.mock.calls.map((c) => (c[0] as NormalizedEmail).subject);
+    expect(subjects).toEqual(['First', 'Poison']);
+    expect(result.failures).toHaveLength(1);
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(12); // poison uid + 1, not 13
+
+    // Storage recovers: markSeen works again.
+    spy.mockRestore();
+
+    await sweep(deps, makeOpts(onEmail));
+
+    const subjectsAfterRecovery = onEmail.mock.calls.map((c) => (c[0] as NormalizedEmail).subject);
+    expect(subjectsAfterRecovery).toEqual(['First', 'Poison', 'Third']); // delivered exactly once each
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(13);
+
+    // No further sends on later sweeps: everything has been handled.
+    await sweep(deps, makeOpts(onEmail));
+    expect(onEmail).toHaveBeenCalledTimes(3);
+  });
+
   it('still notifies only once when the same Message-ID appears twice under the same account (e.g. moved between folders)', async () => {
     const folders = {
       INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
