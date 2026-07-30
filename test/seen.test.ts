@@ -115,3 +115,23 @@ describe('prune', () => {
     expect(store.hasSeen('Personal', '<shared@x>')).toBe(true);
   });
 });
+
+describe('purgeAccount', () => {
+  it('removes folder state and seen records for one account only', () => {
+    store.setFolderState('Work', 'INBOX', { uidNext: 10, uidValidity: 1 });
+    store.setFolderState('Personal', 'INBOX', { uidNext: 20, uidValidity: 2 });
+    store.markSeen('Work', '<a@x>');
+    store.markSeen('Personal', '<b@x>');
+
+    expect(store.purgeAccount('Work')).toBe(2);
+
+    expect(store.getFolderState('Work', 'INBOX')).toBeNull();
+    expect(store.hasSeen('Work', '<a@x>')).toBe(false);
+    expect(store.getFolderState('Personal', 'INBOX')).not.toBeNull();
+    expect(store.hasSeen('Personal', '<b@x>')).toBe(true);
+  });
+
+  it('returns 0 for an account with nothing stored', () => {
+    expect(store.purgeAccount('Ghost')).toBe(0);
+  });
+});

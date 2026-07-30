@@ -100,6 +100,25 @@ export class SeenStore {
     return info.changes;
   }
 
+  /**
+   * Deletes every trace of an account: its per-folder UID state and its
+   * seen-message records. Called when a mailbox is removed, so that
+   * re-adding the same label starts from a fresh baseline rather than
+   * resuming from a stale high-water mark and flooding the operator.
+   */
+  purgeAccount(accountLabel: string): number {
+    const purge = this.#db.transaction((label: string): number => {
+      const state = this.#db
+        .prepare('DELETE FROM folder_state WHERE account_label = ?')
+        .run(label).changes;
+      const seen = this.#db
+        .prepare('DELETE FROM seen_by_account WHERE account_label = ?')
+        .run(label).changes;
+      return state + seen;
+    });
+    return purge(accountLabel);
+  }
+
   close(): void {
     this.#db.close();
   }
