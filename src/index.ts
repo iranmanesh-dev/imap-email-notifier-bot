@@ -123,6 +123,46 @@ export function createEmailHandler(
   };
 }
 
+/** How long `onBeforeExit` waits for the Telegram receiver before giving up on it. */
+const RECEIVER_SHUTDOWN_TIMEOUT_MS = 2000;
+
+/**
+ * Waits for `promise` to settle, but gives up and resolves anyway after
+ * `timeoutMs` if it hasn't. Used by main()'s `onBeforeExit` so a stuck
+ * receiver cannot block shutdown past the container's SIGTERM grace period:
+ * `receiverAbort.abort()` cancels the in-flight `fetch`, but two paths in
+ * `runReceiver`'s loop ignore the signal — the non-abortable backoff sleep
+ * (up to 60s) and an in-flight `onUpdate` (which can be mid-`probeMailbox`,
+ * which has no timeout of its own). Without a bound here, `shutdown` would
+ * stall awaiting the receiver forever, so the watchers, health server, and
+ * both SQLite stores would never get a clean close before Docker SIGKILLs —
+ * exactly what the fault-tolerant `shutdown` design exists to prevent.
+ *
+ * The timer is unref'd so a settled receiver does not itself keep the
+ * process alive waiting for this timeout to fire.
+ */
+export async function withShutdownTimeout(
+  promise: Promise<unknown>,
+  timeoutMs: number,
+  logger: EmailHandlerLogger = consoleLogger
+): Promise<void> {
+  const safeLogger = toSafeLogger(logger);
+  let settled = false;
+
+  const timeout = new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    timer.unref?.();
+  });
+
+  await Promise.race([promise.then(() => { settled = true; }), timeout]);
+
+  if (!settled) {
+    safeLogger.error(
+      `receiver did not settle within ${timeoutMs}ms of abort; continuing shutdown anyway`
+    );
+  }
+}
+
 /** Minimal shape `shutdown` needs from an AccountWatcher, so tests can pass a stub. */
 export type ShutdownWatcher = {
   label: string;
@@ -357,7 +397,11 @@ async function main(): Promise<void> {
       exit: (code) => process.exit(code),
       onBeforeExit: async () => {
         receiverAbort.abort();
-        await receiverDone;
+        // Bounded: receiverDone may not settle promptly (an in-flight
+        // backoff sleep or a probeMailbox call ignore the abort signal), and
+        // mailboxes.close() below must run either way so the database is
+        // always closed cleanly.
+        await withShutdownTimeout(receiverDone, RECEIVER_SHUTDOWN_TIMEOUT_MS, safeConsoleLogger);
         mailboxes.close();
       },
     });

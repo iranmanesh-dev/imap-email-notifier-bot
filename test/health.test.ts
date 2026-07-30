@@ -1,6 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
-import { createEmailHandler, shutdown, startAllWatchers, armPruneTimer } from '../src/index.js';
+import {
+  createEmailHandler,
+  shutdown,
+  startAllWatchers,
+  armPruneTimer,
+  withShutdownTimeout,
+} from '../src/index.js';
 import type { NormalizedEmail } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
@@ -307,6 +313,65 @@ describe('shutdown', () => {
 
     expect(exit).toHaveBeenCalledWith(0);
     expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reaches exit(0) when onBeforeExit awaits a receiver promise that never settles, thanks to withShutdownTimeout bounding the wait', async () => {
+    // Regression for Finding 1: receiverAbort.abort() cancels the in-flight
+    // fetch, but a non-abortable backoff sleep or an in-flight probeMailbox
+    // call (mid onUpdate) can still leave receiverDone unsettled well past
+    // any reasonable shutdown window. onBeforeExit must not block shutdown
+    // on that indefinitely.
+    vi.useFakeTimers();
+    try {
+      const watcher = fakeWatcher('A', async () => {});
+      const health = { close: vi.fn(async () => {}) };
+      const store = { close: vi.fn(() => {}) };
+      const exit = vi.fn();
+      const pruneTimer = setInterval(() => {}, 1_000_000);
+      const neverSettles = new Promise<void>(() => {});
+
+      const done = shutdown('SIGTERM', {
+        watchers: [watcher],
+        pruneTimer,
+        health,
+        store,
+        exit,
+        onBeforeExit: () => withShutdownTimeout(neverSettles, 2000),
+      });
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await done;
+
+      expect(store.close).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('withShutdownTimeout', () => {
+  it('resolves once the promise settles, without waiting for the timeout, and logs nothing', async () => {
+    const logger = { log: vi.fn(), error: vi.fn() };
+    await withShutdownTimeout(Promise.resolve('done'), 2000, logger);
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('gives up and resolves anyway once the timeout elapses, and logs a warning', async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = { log: vi.fn(), error: vi.fn() };
+      const neverSettles = new Promise<void>(() => {});
+
+      const done = withShutdownTimeout(neverSettles, 2000, logger);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(done).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error.mock.calls[0]?.[0]).toContain('2000ms');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

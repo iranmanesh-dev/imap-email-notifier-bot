@@ -20,7 +20,12 @@ function numberVar(env: NodeJS.ProcessEnv, name: string, fallback: number): numb
 
 export function loadConfig(env: NodeJS.ProcessEnv): Config {
   const telegramBotToken = requireVar(env, 'TELEGRAM_BOT_TOKEN');
-  const telegramChatId = requireVar(env, 'TELEGRAM_CHAT_ID');
+  // Trimmed at the source so every consumer (outbound TelegramSender,
+  // the operator-chat-id comparison in handleUpdate, deleteMessage) agrees
+  // by construction. Trailing whitespace here would otherwise make outbound
+  // sends 400 silently (wrong chat_id) while comparisons elsewhere failed
+  // just as silently — two different bugs from one untrimmed env var.
+  const telegramChatId = requireVar(env, 'TELEGRAM_CHAT_ID').trim();
   const masterKey = requireVar(env, 'MASTER_KEY');
 
   if (masterKey.length < MIN_MASTER_KEY_LENGTH) {

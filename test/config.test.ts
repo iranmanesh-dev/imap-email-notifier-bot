@@ -56,4 +56,9 @@ describe('loadConfig', () => {
     const cfg = loadConfig({ ...baseEnv, MAILBOXES: '[{"label":"x"}]' });
     expect(cfg).not.toHaveProperty('mailboxes');
   });
+
+  it('trims surrounding whitespace from TELEGRAM_CHAT_ID', () => {
+    const cfg = loadConfig({ ...baseEnv, TELEGRAM_CHAT_ID: '  999  \n' });
+    expect(cfg.telegramChatId).toBe('999');
+  });
 });
