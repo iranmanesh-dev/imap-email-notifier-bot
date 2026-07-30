@@ -49,7 +49,7 @@ export function imapSweepDeps(client: ImapFlow): SweepDeps {
       };
     },
 
-    async fetchSince(path, uidFrom) {
+    async fetchSince(path, uidFrom, maxMessages) {
       const lock = await client.getMailboxLock(path);
       try {
         const out: { uid: number; source: Buffer }[] = [];
@@ -76,6 +76,11 @@ export function imapSweepDeps(client: ImapFlow): SweepDeps {
             continue;
           }
           out.push({ uid: message.uid, source: message.source });
+          // Stop pulling from the generator entirely once the cap is hit,
+          // rather than buffering everything and truncating the result
+          // afterward: a few hundred bulk-archived messages at ~2MB average
+          // is enough to OOM a small VPS before parsing even starts.
+          if (out.length >= maxMessages) break;
         }
         return out;
       } finally {

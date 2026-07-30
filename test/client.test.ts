@@ -91,7 +91,7 @@ describe('imapSweepDeps.fetchSince', () => {
     });
 
     const deps = imapSweepDeps(client);
-    const result = await deps.fetchSince('INBOX', 5);
+    const result = await deps.fetchSince('INBOX', 5, 100);
 
     expect(result).toEqual([{ uid: 6, source: Buffer.from('secret body content') }]);
     expect(release).toHaveBeenCalledOnce();
@@ -101,6 +101,40 @@ describe('imapSweepDeps.fetchSince', () => {
     expect(logged).toContain('INBOX');
     expect(logged).toContain('5');
     expect(logged).not.toContain('secret body content');
+  });
+});
+
+describe('imapSweepDeps.fetchSince batch cap', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('stops fetching once maxMessages is reached, without pulling further messages from the generator', async () => {
+    const release = vi.fn();
+    let yielded = 0;
+
+    async function* fetchGenerator() {
+      for (let uid = 1; uid <= 1000; uid++) {
+        yielded++;
+        yield { uid, source: Buffer.from(`body ${uid}`) };
+      }
+    }
+
+    const client = fakeClient({
+      getMailboxLock: async () => ({ path: 'INBOX', release }),
+      fetch: () => fetchGenerator(),
+    });
+
+    const deps = imapSweepDeps(client);
+    const result = await deps.fetchSince('INBOX', 1, 10);
+
+    expect(result).toHaveLength(10);
+    expect(result[result.length - 1]!.uid).toBe(10);
+    // Proves the batch cap actually stops iteration early instead of just
+    // truncating the return value after buffering everything: a huge bulk
+    // archive must never fully materialize in memory before the cap kicks in.
+    expect(yielded).toBe(10);
+    expect(release).toHaveBeenCalledOnce();
   });
 });
 

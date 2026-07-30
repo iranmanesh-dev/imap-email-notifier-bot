@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SeenStore } from '../src/store/seen.js';
-import { sweep, type SweepDeps } from '../src/imap/sweeper.js';
+import { sweep, MAX_MESSAGES_PER_SWEEP, type SweepDeps } from '../src/imap/sweeper.js';
 import type { NormalizedEmail } from '../src/types.js';
 
 let dir: string;
@@ -37,7 +37,7 @@ function eml(id: string, subject: string): Buffer {
 type FakeFolder = { uidNext: number; uidValidity: number; messages: { uid: number; source: Buffer }[] };
 
 function makeDeps(folders: Record<string, FakeFolder>) {
-  const fetchCalls: { path: string; uidFrom: number }[] = [];
+  const fetchCalls: { path: string; uidFrom: number; maxMessages: number }[] = [];
   const deps: SweepDeps = {
     async list() {
       return Object.keys(folders).map((path) => ({ path }));
@@ -46,9 +46,14 @@ function makeDeps(folders: Record<string, FakeFolder>) {
       const f = folders[path]!;
       return { uidNext: f.uidNext, uidValidity: f.uidValidity };
     },
-    async fetchSince(path, uidFrom) {
-      fetchCalls.push({ path, uidFrom });
-      return folders[path]!.messages.filter((m) => m.uid >= uidFrom);
+    async fetchSince(path, uidFrom, maxMessages) {
+      fetchCalls.push({ path, uidFrom, maxMessages });
+      // Mirrors the real imapSweepDeps.fetchSince behaviour: ascending UID
+      // order, capped at maxMessages, so tests can exercise truncation.
+      return folders[path]!.messages
+        .filter((m) => m.uid >= uidFrom)
+        .sort((a, b) => a.uid - b.uid)
+        .slice(0, maxMessages);
     },
   };
   return { deps, fetchCalls };
@@ -389,6 +394,76 @@ describe('sweep', () => {
     // No further sends on later sweeps: everything has been handled.
     await sweep(deps, makeOpts(onEmail));
     expect(onEmail).toHaveBeenCalledTimes(3);
+  });
+
+  // --- Finding 3: fetchSince must be batch-capped, and a truncated batch
+  // must advance folder state only to (highest processed uid) + 1, never
+  // to current.uidNext ---
+  //
+  // Without a cap, a user bulk-archiving hundreds of messages makes the next
+  // sweep buffer every one of their full raw sources into memory at once.
+  // Capping the batch is only safe if folder state advances to match what
+  // was actually processed; advancing all the way to current.uidNext after
+  // a truncated batch would silently skip every message beyond the cap.
+
+  it('caps a single sweep at MAX_MESSAGES_PER_SWEEP and advances state only past the highest uid actually processed', async () => {
+    const totalNew = MAX_MESSAGES_PER_SWEEP + 5;
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps, fetchCalls } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail)); // baseline
+
+    folders.INBOX.uidNext = 10 + totalNew;
+    folders.INBOX.messages = Array.from({ length: totalNew }, (_, i) => ({
+      uid: 10 + i,
+      source: eml(`m${i}`, `Subject ${i}`),
+    }));
+
+    const result = await sweep(deps, makeOpts(onEmail));
+
+    expect(fetchCalls.at(-1)!.maxMessages).toBe(MAX_MESSAGES_PER_SWEEP);
+    expect(onEmail).toHaveBeenCalledTimes(MAX_MESSAGES_PER_SWEEP);
+    // Advances only to (highest processed uid) + 1 = 10 + MAX, NOT to
+    // current.uidNext (10 + totalNew) — the bug this fix prevents.
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(10 + MAX_MESSAGES_PER_SWEEP);
+    expect(result.failures).toEqual([]);
+
+    // The following sweep resumes exactly where the truncated batch left
+    // off: every remaining message is delivered, none is skipped, none is
+    // delivered twice.
+    await sweep(deps, makeOpts(onEmail));
+
+    expect(onEmail).toHaveBeenCalledTimes(totalNew);
+    const subjects = onEmail.mock.calls.map((c) => (c[0] as NormalizedEmail).subject);
+    const expectedSubjects = Array.from({ length: totalNew }, (_, i) => `Subject ${i}`);
+    expect(subjects).toEqual(expectedSubjects); // in order, no gap, no duplicate
+    expect(store.getFolderState('Work', 'INBOX')!.uidNext).toBe(10 + totalNew);
+  });
+
+  it('advances to current.uidNext exactly as before when the batch is not truncated', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail));
+
+    folders.INBOX.uidNext = 13;
+    folders.INBOX.messages = [
+      { uid: 10, source: eml('a', 'A') },
+      { uid: 11, source: eml('b', 'B') },
+      { uid: 12, source: eml('c', 'C') },
+    ];
+
+    const result = await sweep(deps, makeOpts(onEmail));
+
+    expect(onEmail).toHaveBeenCalledTimes(3);
+    expect(result.failures).toEqual([]);
+    expect(store.getFolderState('Work', 'INBOX')).toEqual({ uidNext: 13, uidValidity: 1 });
   });
 
   it('still notifies only once when the same Message-ID appears twice under the same account (e.g. moved between folders)', async () => {

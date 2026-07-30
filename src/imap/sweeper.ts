@@ -5,8 +5,24 @@ import type { NormalizedEmail } from '../types.js';
 export type SweepDeps = {
   list(): Promise<{ path: string }[]>;
   status(path: string): Promise<{ uidNext: number; uidValidity: number }>;
-  fetchSince(path: string, uidFrom: number): Promise<{ uid: number; source: Buffer }[]>;
+  fetchSince(
+    path: string,
+    uidFrom: number,
+    maxMessages: number
+  ): Promise<{ uid: number; source: Buffer }[]>;
 };
+
+/**
+ * Upper bound on how many messages a single sweep will fetch from one
+ * folder. Without this, a user bulk-archiving a few hundred messages (wholly
+ * ordinary behaviour) makes the next sweep buffer every one of their full
+ * raw sources -- attachments included -- into memory at once: at ~2MB
+ * average, a few hundred messages is enough to OOM a small VPS. Capping the
+ * batch only prevents that if folder state advances to match what was
+ * actually processed rather than jumping straight to current.uidNext -- see
+ * the truncation handling in sweepFolder below.
+ */
+export const MAX_MESSAGES_PER_SWEEP = 50;
 
 export type SweepOptions = {
   accountLabel: string;
@@ -61,8 +77,14 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
   // notified twice for the same account (moving between folders within one
   // account is still a single notification), while the same message
   // genuinely reaching a different account's mailbox still notifies there.
-  const messages = await deps.fetchSince(path, previous.uidNext);
+  const messages = await deps.fetchSince(path, previous.uidNext, MAX_MESSAGES_PER_SWEEP);
   messages.sort((a, b) => a.uid - b.uid);
+  // Reaching the cap means there may be more messages beyond this batch
+  // (or, in the exact-boundary case where there happen to be precisely
+  // MAX_MESSAGES_PER_SWEEP new messages and no more, "highest uid + 1"
+  // below computes the same value as current.uidNext anyway -- so treating
+  // this as "possibly truncated" is always safe, never wrong).
+  const truncated = messages.length === MAX_MESSAGES_PER_SWEEP;
 
   for (const message of messages) {
     const email = await parseEmail(message.source, {
@@ -117,8 +139,16 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
     }
   }
 
-  // Only advance once the whole batch is handled, so a crash mid-batch retries.
-  opts.store.setFolderState(opts.accountLabel, path, current);
+  // Only advance once the whole batch is handled, so a crash mid-batch
+  // retries. If the batch was truncated by MAX_MESSAGES_PER_SWEEP, advance
+  // only to (highest processed uid) + 1, NOT to current.uidNext -- jumping
+  // straight to current.uidNext here would silently skip every message
+  // beyond the cap, which is the exact failure mode this batching fix must
+  // not introduce. The next sweep resumes from precisely that point.
+  const nextState = truncated
+    ? { uidNext: messages[messages.length - 1]!.uid + 1, uidValidity: current.uidValidity }
+    : current;
+  opts.store.setFolderState(opts.accountLabel, path, nextState);
 }
 
 export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult> {
