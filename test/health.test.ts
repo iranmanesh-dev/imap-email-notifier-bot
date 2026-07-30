@@ -5,11 +5,13 @@ import {
   shutdown,
   restoreMailboxes,
   startDaemon,
+  onReceiverStopped,
   armPruneTimer,
   withShutdownTimeout,
   ONBEFORE_EXIT_TIMEOUT_MS,
 } from '../src/index.js';
 import { WatcherRegistry } from '../src/imap/registry.js';
+import { FatalTelegramError } from '../src/telegram/receiver.js';
 import type { NormalizedEmail, Account } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
@@ -353,6 +355,53 @@ describe('shutdown', () => {
     expect(exit).toHaveBeenCalledWith(0);
   });
 
+  it('honours a non-zero exitCode while still running the whole cleanup sequence', async () => {
+    // Final review, finding 9: a 401 from Telegram called process.exit(1)
+    // directly, skipping every watcher stop, both SQLite closes (so no clean
+    // WAL checkpoint) and the health server close — the clean-shutdown
+    // discipline this branch spent two rounds building. The fatal path has
+    // to go through here, which means shutdown must be able to exit non-zero.
+    const order: string[] = [];
+    const watcher = fakeWatcher('A', async () => {
+      order.push('watcher-stop');
+    });
+    const health = { close: vi.fn(async () => { order.push('health-close'); }) };
+    const store = { close: vi.fn(() => { order.push('store-close'); }) };
+    const mailboxStore = { close: vi.fn(() => { order.push('mailboxStore-close'); }) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('fatal Telegram error', {
+      watchers: [watcher],
+      pruneTimer,
+      health,
+      store,
+      mailboxStore,
+      exit,
+      exitCode: 1,
+    });
+
+    expect(order).toEqual(['watcher-stop', 'health-close', 'store-close', 'mailboxStore-close']);
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still exits with the requested non-zero code when every cleanup step throws', async () => {
+    const watcher = fakeWatcher('A', async () => {
+      throw new Error('logout failed');
+    });
+    const health = { close: vi.fn(async () => { throw new Error('EPIPE'); }) };
+    const store = { close: vi.fn(() => { throw new Error('disk I/O error'); }) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('fatal Telegram error', {
+      watchers: [watcher], pruneTimer, health, store, exit, exitCode: 1,
+    });
+
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
   it('still reaches exit(0) when a caller-supplied onBeforeExit never settles, even with no internal bound of its own (Finding 5)', async () => {
     // shutdown()'s own bound around onBeforeExit must hold regardless of
     // whether the callback bounds itself — belt and braces with the
@@ -617,6 +666,42 @@ describe('restoreMailboxes', () => {
     expect(alert).toHaveBeenCalledTimes(1);
     expect(alert.mock.calls[0]?.[0]).toContain('Broken');
     expect(alert.mock.calls[0]?.[0]).toContain('MASTER_KEY');
+  });
+});
+
+describe('onReceiverStopped', () => {
+  it('routes a fatal Telegram error into the shutdown callback instead of exiting on the spot', () => {
+    const fatal = vi.fn();
+    const logger = { log: vi.fn(), error: vi.fn() };
+
+    onReceiverStopped(new FatalTelegramError('401 Unauthorized: bot token is invalid'), {
+      fatal,
+      logger,
+    });
+
+    expect(fatal).toHaveBeenCalledTimes(1);
+    expect(String(fatal.mock.calls[0]?.[0])).toMatch(/telegram/i);
+    expect(logger.error.mock.calls[0]?.[0]).toContain('401');
+  });
+
+  it('logs but does not request shutdown for an ordinary receiver failure', () => {
+    const fatal = vi.fn();
+    const logger = { log: vi.fn(), error: vi.fn() };
+
+    onReceiverStopped(new Error('socket hang up'), { fatal, logger });
+
+    expect(fatal).not.toHaveBeenCalled();
+    expect(logger.error.mock.calls[0]?.[0]).toContain('socket hang up');
+  });
+
+  it('never throws, even when the logger does', () => {
+    const throwingLogger = {
+      log: vi.fn(() => { throw new Error('EPIPE'); }),
+      error: vi.fn(() => { throw new Error('EPIPE'); }),
+    };
+    expect(() =>
+      onReceiverStopped(new FatalTelegramError('401'), { fatal: vi.fn(), logger: throwingLogger })
+    ).not.toThrow();
   });
 });
 

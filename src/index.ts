@@ -200,13 +200,21 @@ export type ShutdownDeps = {
    */
   mailboxStore?: { close(): void };
   exit: (code: number) => void;
+  /**
+   * Process exit code, defaulting to 0. Exists so an unrecoverable failure
+   * (a 401 from Telegram is the shipped case) can still exit non-zero
+   * WITHOUT skipping the cleanup sequence below — the orchestrator needs to
+   * see a non-zero exit, and the databases still need a clean close.
+   */
+  exitCode?: number;
   logger?: EmailHandlerLogger;
   onBeforeExit?: () => Promise<void>;
 };
 
 /**
  * Stops every watcher, closes the health server, and closes the store, then
- * always calls `exit(0)` — no matter what fails along the way. Extracted
+ * always calls `exit(deps.exitCode ?? 0)` — no matter what fails along the
+ * way. Extracted
  * from main() (mirroring the createEmailHandler extraction) so it is
  * independently testable via an injected `exit` callback instead of a real
  * `process.exit`.
@@ -217,7 +225,7 @@ export type ShutdownDeps = {
  * from ever running — hanging the container on SIGTERM until Docker
  * escalates to SIGKILL, and skipping a clean WAL checkpoint. Each step is
  * isolated so one failure cannot prevent the others, and the whole body runs
- * inside try/finally so `exit(0)` always fires.
+ * inside try/finally so the exit always fires.
  */
 export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void> {
   const logger = toSafeLogger(deps.logger ?? consoleLogger);
@@ -268,7 +276,7 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
       }
     }
   } finally {
-    deps.exit(0);
+    deps.exit(deps.exitCode ?? 0);
   }
 }
 
@@ -374,6 +382,33 @@ export async function restoreMailboxes(deps: RestoreDeps): Promise<void> {
 
 /** The health server once it is actually bound and answering. */
 export type BoundHealthServer = { port: number; close(): Promise<void> };
+
+/**
+ * Decides what a terminated Telegram receiver means.
+ *
+ * A `FatalTelegramError` (a 401 — revoked or mistyped bot token) is
+ * unrecoverable: no amount of retrying fixes it, so the process must exit
+ * non-zero for the orchestrator to notice. It used to do that with a bare
+ * `process.exit(1)` at the call site, which skipped every watcher stop, both
+ * SQLite closes (so no clean WAL checkpoint), and the health server close.
+ * Routing it through `fatal` instead lets the caller run the same shutdown
+ * sequence a SIGTERM would, just with a non-zero exit code.
+ *
+ * Extracted rather than left inline so the routing itself is testable —
+ * main() is not.
+ */
+export function onReceiverStopped(
+  err: unknown,
+  deps: { fatal: (reason: string) => void; logger?: EmailHandlerLogger }
+): void {
+  const safeLogger = toSafeLogger(deps.logger ?? consoleLogger);
+  if (err instanceof FatalTelegramError) {
+    safeLogger.error(`fatal: ${err.message}`);
+    deps.fatal(`fatal Telegram error: ${err.message}`);
+    return;
+  }
+  safeLogger.error(`receiver stopped: ${errorMessage(err)}`);
+}
 
 export type DaemonDeps = {
   healthPort: number;
@@ -518,6 +553,7 @@ async function main(): Promise<void> {
       store,
       mailboxStore: mailboxes,
       exit: (c) => process.exit(c),
+      exitCode: code,
       onBeforeExit: async () => {
         receiverAbort.abort();
         // Bounded: receiverDone may not settle promptly (an in-flight
@@ -558,11 +594,11 @@ async function main(): Promise<void> {
             now: () => Date.now(),
           }),
       }).catch((err: unknown) => {
-        if (err instanceof FatalTelegramError) {
-          safeConsoleLogger.error(`fatal: ${err.message}`);
-          process.exit(1);
-        }
-        safeConsoleLogger.error(`receiver stopped: ${errorMessage(err)}`);
+        onReceiverStopped(err, {
+          // Same clean-shutdown sequence a SIGTERM gets, but exiting 1.
+          fatal: (reason) => beginShutdown(reason, 1),
+          logger: safeConsoleLogger,
+        });
       }),
     // Detached inside startDaemon: a mailbox that cannot connect must not
     // hold the health port, the receiver, or the signal handlers hostage.
