@@ -1,4 +1,5 @@
 import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, type Conversations } from './conversation.js';
+import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
@@ -135,14 +136,20 @@ async function completeAdd(
 
   const result = await deps.probe(account);
   if (!result.ok) {
-    return deps.reply(`Could not connect, so nothing was saved.\n\n${result.reason}`);
+    // Scrubbed again here even though probeMailbox already scrubs its own
+    // reason. `probe` is an injected dependency, and this is the boundary
+    // where text actually leaves for Telegram — the last place that can
+    // still guarantee it. Cheap, and it makes the guarantee local.
+    return deps.reply(
+      `Could not connect, so nothing was saved.\n\n${scrubSecret(result.reason, password)}`
+    );
   }
 
   try {
     deps.mailboxes.add(account);
   } catch (err) {
     // Failed before persisting anything — nothing to clean up.
-    return deps.reply(`Failed to save: ${scrubPassword(errorText(err), password)}`);
+    return deps.reply(`Failed to save: ${scrubSecret(errorText(err), password)}`);
   }
 
   try {
@@ -153,7 +160,7 @@ async function completeAdd(
     // believes doesn't exist, blocking a later /add with the same label.
     return deps.reply(
       `Saved "${account.label}", but failed to start watching it: ` +
-        `${scrubPassword(errorText(err), password)}\n` +
+        `${scrubSecret(errorText(err), password)}\n` +
         `It is not being monitored. Run /remove "${account.label}" and add it again, ` +
         `or restart the bot to retry starting the watcher.`
     );
@@ -302,19 +309,9 @@ async function testMailbox(args: string[], deps: CommandDeps): Promise<void> {
   const result = await deps.probe(account);
   return result.ok
     ? deps.reply(`"${label}" connected — ${result.folders} folders.`)
-    : deps.reply(`"${label}" failed to connect.\n\n${result.reason}`);
+    : deps.reply(`"${label}" failed to connect.\n\n${scrubSecret(result.reason, account.pass)}`);
 }
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * Strips a raw password out of arbitrary error text before it reaches a
- * reply. A thrown error (e.g. from the store) could echo its input, so this
- * is scrubbed at the boundary the same way probeMailbox scrubs IMAP errors.
- */
-function scrubPassword(text: string, password: string): string {
-  if (password.length === 0) return text;
-  return text.split(password).join('***');
 }

@@ -152,12 +152,22 @@ describe('/add', () => {
   });
 
   it('never echoes the password in the probe-failure reply', async () => {
+    // The probe reason must actually CONTAIN the password for this
+    // assertion to be load-bearing. A stub returning a constant like
+    // 'AUTHENTICATIONFAILED' — a string that never held the password —
+    // makes the assertion trivially true and would pass against any
+    // implementation. A server echoing the rejected LOGIN back is the real
+    // failure mode, and is why probe.ts scrubs at all.
     const { deps, replies } = makeDeps({
-      probe: async () => ({ ok: false, reason: 'AUTHENTICATIONFAILED' }),
+      probe: async (a: Account) => ({
+        ok: false as const,
+        reason: `login failed for ${a.user} with ${a.pass}`,
+      }),
     });
     await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
     await handleUpdate(msg('s3cret-pw', OPERATOR, 81), deps);
     expect(replies.join('\n')).not.toContain('s3cret-pw');
+    expect(replies.at(-1)).toContain('***'); // scrubbed, not merely absent
   });
 
   it('never echoes the password in the delete-failure warning', async () => {
@@ -437,13 +447,19 @@ describe('/status and /test', () => {
   });
 
   it('/test never leaks the password on failure', async () => {
+    // Same reasoning as the /add probe-failure test: the reason has to
+    // embed the password, or the assertion holds for free.
     const { deps, replies } = makeDeps({
-      probe: async () => ({ ok: false, reason: 'login failed' }),
+      probe: async (a: Account) => ({
+        ok: false as const,
+        reason: `login failed for ${a.user} with ${a.pass}`,
+      }),
     });
     deps.mailboxes.add({
       label: 'Work', host: 'h', port: 993, user: 'u', pass: 'topsecret', secure: true,
     });
     await handleUpdate(msg('/test Work'), deps);
     expect(replies[0]).not.toContain('topsecret');
+    expect(replies[0]).toContain('***'); // scrubbed, not merely absent
   });
 });
