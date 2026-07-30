@@ -52,13 +52,21 @@ type FakeClientRecord = {
   logoutCalls: number;
   noopCalls: number;
   emit: (event: string, ...args: unknown[]) => void;
+  /** Resolves this client's in-flight connect() call, if deferConnect held it open. */
+  resolveConnect: () => void;
+  rejectConnect: (err: Error) => void;
 };
 
-function createTrackedClientFactory(opts: { failConnect?: () => boolean } = {}) {
+function createTrackedClientFactory(
+  opts: { failConnect?: () => boolean; deferConnect?: () => boolean } = {}
+) {
   const records: FakeClientRecord[] = [];
 
   const factory = vi.fn((_account: Account) => {
     const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    let resolveConnect: (() => void) | null = null;
+    let rejectConnect: ((err: Error) => void) | null = null;
+
     const record: FakeClientRecord = {
       usable: true,
       loggedOut: false,
@@ -68,6 +76,8 @@ function createTrackedClientFactory(opts: { failConnect?: () => boolean } = {}) 
       emit: (event, ...args) => {
         for (const cb of listeners.get(event) ?? []) cb(...args);
       },
+      resolveConnect: () => resolveConnect?.(),
+      rejectConnect: (err: Error) => rejectConnect?.(err),
     };
 
     const client = {
@@ -77,6 +87,12 @@ function createTrackedClientFactory(opts: { failConnect?: () => boolean } = {}) 
       connect: vi.fn(async () => {
         record.connectCalls += 1;
         if (opts.failConnect?.()) throw new Error('ECONNREFUSED');
+        if (opts.deferConnect?.()) {
+          await new Promise<void>((resolve, reject) => {
+            resolveConnect = resolve;
+            rejectConnect = reject;
+          });
+        }
       }),
       mailboxOpen: vi.fn(async () => {}),
       noop: vi.fn(async () => {
@@ -99,6 +115,18 @@ function createTrackedClientFactory(opts: { failConnect?: () => boolean } = {}) 
   });
 
   return { factory, records };
+}
+
+/**
+ * Advances the microtask queue without touching real or fake timers, so
+ * promise chains inside the watcher (which never use timers on the success
+ * path — only `sleep`, which tests stub as instant) can be driven forward
+ * deterministically to a specific await point.
+ */
+async function flushMicrotasks(iterations = 20): Promise<void> {
+  for (let i = 0; i < iterations; i++) {
+    await Promise.resolve();
+  }
 }
 
 describe('AccountWatcher', () => {
@@ -500,6 +528,16 @@ describe('AccountWatcher', () => {
         await watcher.start();
         expect(watcher.state).toBe('ok');
 
+        // Force the stale-idler branch, not the healthy noop() branch: if we
+        // left the idle client "usable", it would never matter whether the
+        // terminal-state guard existed, because #checkIdleHealth would take
+        // the noop() path regardless and the assertions below would pass
+        // either way. Making the idle client genuinely stale means only the
+        // terminal-state guard (not incidental healthiness) can be why no
+        // reconnect attempt happens.
+        const idleRecord = records[1]!;
+        idleRecord.usable = false;
+
         records[0]!.usable = false; // sweep connection dies
         failFlag.value = true; // every future connect attempt now fails
 
@@ -512,38 +550,49 @@ describe('AccountWatcher', () => {
 
         await vi.advanceTimersByTimeAsync(9 * 60_000); // one idle-watchdog period
 
-        expect(factory.mock.calls.length).toBe(factoryCallsAtTerminal); // no further attempts
+        expect(factory.mock.calls.length).toBe(factoryCallsAtTerminal); // no reconnect attempt
+        expect(idleRecord.noopCalls).toBe(0); // and the healthy branch didn't run either
       });
     } finally {
       vi.useRealTimers();
     }
   });
 
-  it('stop() clears the idle watchdog timer', async () => {
-    await withStore(async (store) => {
-      const { factory } = createTrackedClientFactory();
-      const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
+  it('stop() clears the idle watchdog timer so no tick occurs afterward', async () => {
+    // Counting clearInterval() calls is non-discriminating: the pre-fix
+    // code already called it exactly twice in stop() regardless of whether
+    // the idle timer reference was tracked correctly. Assert the actual
+    // effect instead — advancing past a full IDLE_REFRESH_MS period after
+    // stop() must not touch the (now-defunct) idle client or the factory.
+    vi.useFakeTimers();
+    try {
+      await withStore(async (store) => {
+        const { factory, records } = createTrackedClientFactory();
 
-      const watcher = new AccountWatcher({
-        account,
-        store,
-        previewChars: 200,
-        sweepIntervalSeconds: 3600,
-        onEmail: async () => {},
-        onFatal: async () => {},
-        deps: { createClientImpl: factory, sleep: async () => {} },
+        const watcher = new AccountWatcher({
+          account,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { createClientImpl: factory, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        const idleRecord = records[1]!;
+        await watcher.stop();
+
+        const factoryCallsAfterStop = factory.mock.calls.length;
+
+        await vi.advanceTimersByTimeAsync(9 * 60_000); // one IDLE_REFRESH_MS period
+
+        expect(idleRecord.noopCalls).toBe(0); // no watchdog tick touched anything
+        expect(factory.mock.calls.length).toBe(factoryCallsAfterStop); // no reconnect attempt
       });
-
-      await watcher.start();
-      clearIntervalSpy.mockClear();
-
-      await watcher.stop();
-
-      // Both the sweep-interval timer and the idle-watchdog timer must be cleared.
-      expect(clearIntervalSpy).toHaveBeenCalledTimes(2);
-
-      clearIntervalSpy.mockRestore();
-    });
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("the idle client's exists event triggers a real sweep", async () => {
@@ -633,6 +682,102 @@ describe('AccountWatcher', () => {
       expect(watcher.state).toBe('ok');
 
       await watcher.stop();
+    });
+  });
+
+  // --- Round 3: stop() racing an in-flight connect ---
+  //
+  // Neither #connectSweep nor #connectIdle re-checked #stopped after their
+  // awaits. If stop() ran while one of them was awaiting client.connect(),
+  // stop() would log out an already-null field and clear the timer, then
+  // the in-flight connect would resume, assign the now-live client to the
+  // field, and (for the idle client) re-arm a fresh watchdog interval —
+  // an open connection and a live interval both outliving stop().
+
+  it('does not leak a client or re-arm the idle watchdog if stop() runs while #connectIdle is awaiting connect()', async () => {
+    await withStore(async (store) => {
+      const setIntervalSpy = vi.spyOn(global, 'setInterval');
+      const { factory, records } = createTrackedClientFactory({ deferConnect: () => true });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      const startPromise = watcher.start();
+      await flushMicrotasks();
+      expect(records.length).toBe(1); // only the sweep client so far, still connecting
+      records[0]!.resolveConnect(); // let #connectSweep finish
+
+      await flushMicrotasks();
+      expect(records.length).toBe(2); // #connectIdle has created the idle client...
+      expect(records[1]!.connectCalls).toBe(1); // ...and is awaiting its connect()
+
+      const stopPromise = watcher.stop(); // races the in-flight idle connect
+      await flushMicrotasks();
+
+      records[1]!.resolveConnect(); // release the idle connect() only now, after stop() ran
+
+      await startPromise;
+      await stopPromise;
+
+      expect(records.length).toBe(2); // no extra client was created
+      expect(records[1]!.loggedOut).toBe(true); // the late-arriving idle client was logged out
+      expect(records.filter((r) => !r.loggedOut).length).toBe(0); // zero live connections
+      // Neither the periodic sweep timer nor the idle watchdog was ever
+      // armed: start() bails on #stopped before scheduling its timer, and
+      // #connectIdle returns before calling #startIdleWatchdog.
+      expect(setIntervalSpy).not.toHaveBeenCalled();
+
+      setIntervalSpy.mockRestore();
+    });
+  });
+
+  it('does not leak a client if stop() runs while #connectSweep is awaiting connect() during a sweep-triggered reconnect', async () => {
+    await withStore(async (store) => {
+      const deferFlag = { value: false };
+      const { factory, records } = createTrackedClientFactory({
+        deferConnect: () => deferFlag.value,
+      });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start(); // both clients connect normally; deferFlag still false
+      expect(records.length).toBe(2);
+
+      records[0]!.usable = false; // sweep connection dies
+      deferFlag.value = true; // the reconnect's client.connect() will now pause
+
+      const sweepPromise = watcher.triggerSweep(); // discovers the broken client, reconnects
+      await flushMicrotasks();
+      expect(records.length).toBe(3); // a replacement sweep client is being created
+      expect(records[2]!.connectCalls).toBe(1); // and is awaiting its connect()
+
+      const stopPromise = watcher.stop(); // races the in-flight reconnect
+      await flushMicrotasks();
+
+      records[2]!.resolveConnect(); // release the reconnect's connect() only now
+
+      await sweepPromise;
+      await stopPromise;
+
+      expect(records.length).toBe(3); // no further extras created
+      expect(records[2]!.loggedOut).toBe(true); // the late-arriving replacement was logged out
+      expect(records.filter((r) => !r.loggedOut).length).toBe(0); // zero live connections
+      expect(watcher.state).toBe('stopped');
     });
   });
 });

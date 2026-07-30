@@ -86,7 +86,12 @@ export class AccountWatcher {
 
   async start(): Promise<void> {
     const connected = await this.#connectWithRetry(() => this.#connect());
-    if (!connected) return;
+    // Also bail if #stopped raced in during that connect: #connectSweep/
+    // #connectIdle already discard the client they were holding in that
+    // case (see Finding 8), but without this check we would still overwrite
+    // a 'stopped' state with 'ok' and arm a sweep-interval timer that would
+    // outlive stop().
+    if (!connected || this.#stopped) return;
 
     this.#state = 'ok';
     await this.triggerSweep();
@@ -162,7 +167,11 @@ export class AccountWatcher {
           return false;
         }
 
-        this.#state = 'reconnecting';
+        // Gate on !#stopped for the same reason as the #runSweep writes
+        // (Finding 5): stop() can flip #stopped while connectFn() above was
+        // in flight, and this write must not clobber the 'stopped' state it
+        // sets afterward.
+        if (!this.#stopped) this.#state = 'reconnecting';
         const base = Math.min(2 ** attempt * 1000, MAX_BACKOFF_MS);
         const jitter = base * 0.2 * Math.random();
         await this.#sleep(Math.min(base + jitter, MAX_BACKOFF_MS));
@@ -180,6 +189,7 @@ export class AccountWatcher {
       return;
     }
     await this.#connectSweep();
+    if (this.#stopped) return; // stop() raced in; #connectSweep already discarded its client
     await this.#connectIdle();
   }
 
@@ -205,6 +215,15 @@ export class AccountWatcher {
     }
     const client = this.#createClientImpl(this.#opts.account);
     await client.connect();
+    if (this.#stopped) {
+      // stop() ran while client.connect() was in flight. stop() has already
+      // logged out whatever #sweepClient held (null, at this point) and
+      // cleared the timers; if we assigned this freshly connected client
+      // now, it would silently outlive stop() as an orphaned connection
+      // that nothing ever logs out. Discard it instead of adopting it.
+      await client.logout().catch(() => undefined);
+      return;
+    }
     this.#sweepClient = client;
   }
 
@@ -229,7 +248,18 @@ export class AccountWatcher {
     }
     const client = this.#createClientImpl(this.#opts.account);
     await client.connect();
+    if (this.#stopped) {
+      // Same race as #connectSweep: stop() ran while we were connecting.
+      // Discard this client rather than adopting it and re-arming the
+      // watchdog on a connection nothing will ever log out again.
+      await client.logout().catch(() => undefined);
+      return;
+    }
     await client.mailboxOpen('INBOX');
+    if (this.#stopped) {
+      await client.logout().catch(() => undefined);
+      return;
+    }
 
     // ImapFlow idles automatically on an open mailbox and emits `exists`
     // when the server reports new messages. That is our early-sweep signal.
