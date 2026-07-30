@@ -150,7 +150,11 @@ this repo):
 3. Add a persistent volume mounted at `/data` yourself — this mode has no
    compose file to declare it, so skipping this step means the dedup database
    does not survive a redeploy.
-4. Deploy.
+4. Set the stop grace period to **20 seconds** if the platform exposes it. This
+   mode has no compose file, so it does not inherit the `stop_grace_period`
+   declared in `docker-compose.yml`, and Docker's 10s default can SIGKILL a
+   clean shutdown midway — see [Shutdown](#shutdown) below.
+5. Deploy.
 
 **What "healthy" means here:** the container's healthcheck reports pure
 liveness — did `/healthz` respond at all — not whether every mailbox is
@@ -181,6 +185,22 @@ to know when a mailbox is actually degraded, use one of:
   minutes between attempts, up to 20 consecutive failures per account) rather
   than treated as fatal — the process keeps running and `/healthz` reports
   503 for that account until it reconnects or exhausts the retry budget.
+
+### Shutdown
+
+On `SIGTERM` the app stops every watcher, closes the health server and closes both
+SQLite databases before exiting, so the write-ahead log is checkpointed cleanly.
+
+An ordinary shutdown finishes in well under a second, but the worst case is bounded
+rather than instant: up to 5s waiting for the Telegram receiver to notice the abort,
+plus up to 5s draining an in-flight mailbox sweep (so it cannot write notification
+state back after a removal has purged it), plus the IMAP logouts — roughly 11–12
+seconds.
+
+That exceeds Docker's default 10s grace period, after which the container is SIGKILLed
+and the databases never close cleanly. `docker-compose.yml` therefore sets
+`stop_grace_period: 20s`. If you run the image without that compose file, set an
+equivalent stop timeout yourself.
 
 ## Configuration
 

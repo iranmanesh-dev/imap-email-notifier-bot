@@ -2,6 +2,15 @@ services:
   notifier:
     build: .
     restart: unless-stopped
+    # Docker's default grace period is 10s, and a worst-case clean shutdown
+    # no longer fits inside it: ONBEFORE_EXIT_TIMEOUT_MS (5s, waiting on the
+    # Telegram receiver) + SWEEP_DRAIN_TIMEOUT_MS (5s, waiting on an
+    # in-flight sweep so it cannot write seen-state back after a purge) +
+    # the IMAP logouts ~= 11-12s. Exceeding the grace period means SIGKILL,
+    # which skips both SQLite closes and therefore the clean WAL checkpoint.
+    # 20s leaves headroom without meaningfully slowing a redeploy: the
+    # ordinary shutdown still finishes in well under a second.
+    stop_grace_period: 20s
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
