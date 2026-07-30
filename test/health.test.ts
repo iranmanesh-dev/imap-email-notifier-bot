@@ -6,6 +6,7 @@ import {
   startAllWatchers,
   armPruneTimer,
   withShutdownTimeout,
+  ONBEFORE_EXIT_TIMEOUT_MS,
 } from '../src/index.js';
 import type { NormalizedEmail } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
@@ -280,6 +281,104 @@ describe('shutdown', () => {
     await shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, exit });
 
     expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('closes the mailbox store after the watchers stop and the health server closes, not from within onBeforeExit (Finding 4)', async () => {
+    // Regression: closing the mailbox store from inside onBeforeExit could
+    // race an in-flight command (e.g. mid-probeMailbox) that resumes and
+    // then calls mailboxes.add/remove/get against an already-closed
+    // database. Deferring the close to alongside store.close() gives that
+    // command the longest practical window to finish first.
+    const order: string[] = [];
+    const watcher = fakeWatcher('A', async () => {
+      order.push('watcher-stop');
+    });
+    const health = {
+      close: vi.fn(async () => {
+        order.push('health-close');
+      }),
+    };
+    const store = {
+      close: vi.fn(() => {
+        order.push('store-close');
+      }),
+    };
+    const mailboxStore = {
+      close: vi.fn(() => {
+        order.push('mailboxStore-close');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', {
+      watchers: [watcher],
+      pruneTimer,
+      health,
+      store,
+      mailboxStore,
+      exit,
+      onBeforeExit: async () => {
+        order.push('onBeforeExit');
+      },
+    });
+
+    expect(order).toEqual([
+      'onBeforeExit',
+      'watcher-stop',
+      'health-close',
+      'store-close',
+      'mailboxStore-close',
+    ]);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still exits 0 and still closes store when mailboxStore fails to close', async () => {
+    const watcher = fakeWatcher('A', async () => {});
+    const health = { close: vi.fn(async () => {}) };
+    const store = { close: vi.fn(() => {}) };
+    const mailboxStore = {
+      close: vi.fn(() => {
+        throw new Error('db already closed');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, mailboxStore, exit });
+
+    expect(store.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still reaches exit(0) when a caller-supplied onBeforeExit never settles, even with no internal bound of its own (Finding 5)', async () => {
+    // shutdown()'s own bound around onBeforeExit must hold regardless of
+    // whether the callback bounds itself — belt and braces with the
+    // shipped closure's internal withShutdownTimeout(receiverDone, ...).
+    vi.useFakeTimers();
+    try {
+      const watcher = fakeWatcher('A', async () => {});
+      const health = { close: vi.fn(async () => {}) };
+      const store = { close: vi.fn(() => {}) };
+      const exit = vi.fn();
+      const pruneTimer = setInterval(() => {}, 1_000_000);
+
+      const done = shutdown('SIGTERM', {
+        watchers: [watcher],
+        pruneTimer,
+        health,
+        store,
+        exit,
+        onBeforeExit: () => new Promise<void>(() => {}),
+      });
+
+      await vi.advanceTimersByTimeAsync(ONBEFORE_EXIT_TIMEOUT_MS);
+      await done;
+
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('always exits 0, never rejects, and clears the prune timer, even when everything (including the logger) throws', async () => {

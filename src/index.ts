@@ -127,6 +127,18 @@ export function createEmailHandler(
 const RECEIVER_SHUTDOWN_TIMEOUT_MS = 2000;
 
 /**
+ * Belt-and-braces outer bound `shutdown` itself applies around a
+ * caller-supplied `onBeforeExit`, independent of whatever internal bound
+ * that callback may or may not apply to itself. Strictly larger than
+ * `RECEIVER_SHUTDOWN_TIMEOUT_MS` so, in the shipped shape (main()'s
+ * `onBeforeExit` already races `receiverDone` against that shorter timeout),
+ * this outer one is not expected to be the one that fires — it exists so the
+ * "always exits" contract holds even for a future caller whose own
+ * `onBeforeExit` is not itself bounded.
+ */
+export const ONBEFORE_EXIT_TIMEOUT_MS = 5000;
+
+/**
  * Waits for `promise` to settle, but gives up and resolves anyway after
  * `timeoutMs` if it hasn't. Used by main()'s `onBeforeExit` so a stuck
  * receiver cannot block shutdown past the container's SIGTERM grace period:
@@ -139,7 +151,10 @@ const RECEIVER_SHUTDOWN_TIMEOUT_MS = 2000;
  * exactly what the fault-tolerant `shutdown` design exists to prevent.
  *
  * The timer is unref'd so a settled receiver does not itself keep the
- * process alive waiting for this timeout to fire.
+ * process alive waiting for this timeout to fire; both call sites in
+ * `shutdown`/`main()` invoke this before the health server closes and before
+ * the watchers stop, so those still-open handles keep the event loop alive
+ * long enough for an unref'd timer to fire regardless.
  */
 export async function withShutdownTimeout(
   promise: Promise<unknown>,
@@ -174,6 +189,15 @@ export type ShutdownDeps = {
   pruneTimer: NodeJS.Timeout;
   health: { close(): Promise<void> };
   store: { close(): void };
+  /**
+   * Closed after the watchers stop and the health server closes, alongside
+   * `store` — not from within `onBeforeExit`. `onBeforeExit` runs while an
+   * `onUpdate` handler may still be mid-`probeMailbox`; closing the mailbox
+   * store there would let that in-flight command resume against an
+   * already-closed database. Deferring the close to here maximises the
+   * window such a command has to finish before the database goes away.
+   */
+  mailboxStore?: { close(): void };
   exit: (code: number) => void;
   logger?: EmailHandlerLogger;
   onBeforeExit?: () => Promise<void>;
@@ -202,7 +226,14 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
 
     if (deps.onBeforeExit) {
       try {
-        await deps.onBeforeExit();
+        // Bounded even though the shipped onBeforeExit already bounds
+        // itself (Finding 1's withShutdownTimeout around receiverDone):
+        // this is shutdown()'s own guarantee, so a future caller supplying
+        // an unbounded onBeforeExit cannot stall exit(0) either. Both the
+        // health server and the watchers are still open at this point (they
+        // close later, below), so the event loop stays alive long enough
+        // for this timer to fire regardless of its unref().
+        await withShutdownTimeout(deps.onBeforeExit(), ONBEFORE_EXIT_TIMEOUT_MS, logger);
       } catch (err) {
         logger.error(`pre-exit cleanup failed: ${errorMessage(err)}`);
       }
@@ -226,6 +257,14 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
       deps.store.close();
     } catch (err) {
       logger.error(`store failed to close cleanly: ${errorMessage(err)}`);
+    }
+
+    if (deps.mailboxStore) {
+      try {
+        deps.mailboxStore.close();
+      } catch (err) {
+        logger.error(`mailbox store failed to close cleanly: ${errorMessage(err)}`);
+      }
     }
   } finally {
     deps.exit(0);
@@ -394,15 +433,19 @@ async function main(): Promise<void> {
       pruneTimer,
       health,
       store,
+      mailboxStore: mailboxes,
       exit: (code) => process.exit(code),
       onBeforeExit: async () => {
         receiverAbort.abort();
         // Bounded: receiverDone may not settle promptly (an in-flight
-        // backoff sleep or a probeMailbox call ignore the abort signal), and
-        // mailboxes.close() below must run either way so the database is
-        // always closed cleanly.
+        // backoff sleep or a probeMailbox call ignore the abort signal).
+        // mailboxes.close() is deliberately NOT called here — it is passed
+        // as `mailboxStore` above and closed later in shutdown()'s main
+        // sequence (after watchers stop and the health server closes), so
+        // an in-flight command that resumes after this bounded wait still
+        // has the longest practical window to finish before the database
+        // goes away.
         await withShutdownTimeout(receiverDone, RECEIVER_SHUTDOWN_TIMEOUT_MS, safeConsoleLogger);
-        mailboxes.close();
       },
     });
   };
