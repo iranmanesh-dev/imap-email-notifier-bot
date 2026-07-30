@@ -196,6 +196,60 @@ describe('runReceiver', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
+  it('redacts the bot token from a logged network-error message', async () => {
+    // A realistic long, high-entropy token, not the single-character 'T'
+    // used elsewhere — a short token could pass this assertion by
+    // accidentally over-redacting unrelated text rather than because
+    // redaction actually ran.
+    const REALISTIC_TOKEN = '123456789:AAHExampleFakeRealisticBotTokenValue1234';
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let poll = 0;
+      const fetchImpl = (async (url: string) => {
+        if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+        poll += 1;
+        if (poll === 1) {
+          // The classic real-world leak: a token with stray whitespace (e.g.
+          // a trailing newline from an env var) makes undici's fetch throw
+          // a TypeError whose message embeds the full request URL,
+          // including the token.
+          throw new Error(
+            `Failed to parse URL from https://api.telegram.org/bot${REALISTIC_TOKEN}/getUpdates`
+          );
+        }
+        return okUpdates([]);
+      }) as unknown as typeof fetch;
+
+      const controller = new AbortController();
+      let seen = 0;
+      const counting = (async (...args: Parameters<typeof fetch>) => {
+        seen += 1;
+        const res = await (fetchImpl as (...a: Parameters<typeof fetch>) => Promise<Response>)(...args);
+        if (seen >= 3) controller.abort();
+        return res;
+      }) as unknown as typeof fetch;
+
+      await runReceiver({
+        token: REALISTIC_TOKEN,
+        onUpdate: async () => {},
+        signal: controller.signal,
+        fetchImpl: counting,
+        sleep: async () => {},
+      });
+
+      // The network-error branch must actually have logged something —
+      // otherwise this test would prove nothing, the same way the old spy
+      // loop over an empty 401 call list proved nothing.
+      expect(errorSpy.mock.calls.length).toBeGreaterThan(0);
+
+      const loggedText = errorSpy.mock.calls.map((call) => call.map(String).join(' ')).join('\n');
+      expect(loggedText).not.toContain(REALISTIC_TOKEN);
+      expect(loggedText).toContain('***');
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('never puts the bot token in a thrown error message or a logged line', async () => {
     const fetchImpl = (async (url: string) =>
       url.includes('deleteWebhook')
