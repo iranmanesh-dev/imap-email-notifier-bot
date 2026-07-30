@@ -37,8 +37,22 @@ describe('secret', () => {
     expect(() => decryptSecret(blob, KEY)).toThrow();
   });
 
+  it('fails when the IV is tampered with', () => {
+    const blob = encryptSecret('hunter2', KEY);
+    blob[0] ^= 0xff;
+    expect(() => decryptSecret(blob, KEY)).toThrow();
+  });
+
   it('rejects a truncated blob instead of reading out of bounds', () => {
     expect(() => decryptSecret(Buffer.alloc(8), KEY)).toThrow(/too short/i);
+  });
+
+  it('rejects a blob with zero ciphertext (exactly IV + tag)', () => {
+    expect(() => decryptSecret(Buffer.alloc(28), KEY)).toThrow(/too short/i);
+  });
+
+  it('rejects an empty plaintext at encrypt time', () => {
+    expect(() => encryptSecret('', KEY)).toThrow(/empty/i);
   });
 
   it('derives the same key from the same master key', () => {

@@ -13,6 +13,9 @@ export function deriveKey(masterKey: string): Buffer {
 
 /** Returns `iv ‖ authTag ‖ ciphertext`. */
 export function encryptSecret(plaintext: string, key: Buffer): Buffer {
+  if (plaintext.length === 0) {
+    throw new Error('cannot encrypt an empty secret');
+  }
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv('aes-256-gcm', key, iv);
   const ciphertext = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
