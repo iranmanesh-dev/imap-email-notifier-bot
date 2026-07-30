@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import type { ImapFlow } from 'imapflow';
 import { SeenStore } from '../src/store/seen.js';
 import { AccountWatcher } from '../src/imap/watcher.js';
@@ -55,17 +56,29 @@ type FakeClientRecord = {
   /** Resolves this client's in-flight connect() call, if deferConnect held it open. */
   resolveConnect: () => void;
   rejectConnect: (err: Error) => void;
+  /** Resolves this client's in-flight mailboxOpen() call, if deferMailboxOpen held it open. */
+  resolveMailboxOpen: () => void;
 };
 
 function createTrackedClientFactory(
-  opts: { failConnect?: () => boolean; deferConnect?: () => boolean } = {}
+  opts: {
+    failConnect?: () => boolean;
+    deferConnect?: () => boolean;
+    deferMailboxOpen?: () => boolean;
+  } = {}
 ) {
   const records: FakeClientRecord[] = [];
 
   const factory = vi.fn((_account: Account) => {
-    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    // A real EventEmitter (not a hand-rolled listener map) so `emit('error',
+    // ...)` reproduces Node's actual behaviour: with zero 'error' listeners
+    // registered, emit() throws synchronously. That is the exact mechanism
+    // behind the CRITICAL finding (an unguarded sweep-client 'error' event
+    // kills the process), so tests must be able to observe it faithfully.
+    const emitter = new EventEmitter();
     let resolveConnect: (() => void) | null = null;
     let rejectConnect: ((err: Error) => void) | null = null;
+    let resolveMailboxOpen: (() => void) | null = null;
 
     const record: FakeClientRecord = {
       usable: true,
@@ -74,10 +87,11 @@ function createTrackedClientFactory(
       logoutCalls: 0,
       noopCalls: 0,
       emit: (event, ...args) => {
-        for (const cb of listeners.get(event) ?? []) cb(...args);
+        emitter.emit(event, ...args);
       },
       resolveConnect: () => resolveConnect?.(),
       rejectConnect: (err: Error) => rejectConnect?.(err),
+      resolveMailboxOpen: () => resolveMailboxOpen?.(),
     };
 
     const client = {
@@ -94,7 +108,13 @@ function createTrackedClientFactory(
           });
         }
       }),
-      mailboxOpen: vi.fn(async () => {}),
+      mailboxOpen: vi.fn(async () => {
+        if (opts.deferMailboxOpen?.()) {
+          await new Promise<void>((resolve) => {
+            resolveMailboxOpen = resolve;
+          });
+        }
+      }),
       noop: vi.fn(async () => {
         record.noopCalls += 1;
       }),
@@ -103,9 +123,7 @@ function createTrackedClientFactory(
         record.logoutCalls += 1;
       }),
       on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
-        const list = listeners.get(event) ?? [];
-        list.push(cb);
-        listeners.set(event, list);
+        emitter.on(event, cb);
         return client;
       }),
     };
@@ -778,6 +796,73 @@ describe('AccountWatcher', () => {
       expect(records[2]!.loggedOut).toBe(true); // the late-arriving replacement was logged out
       expect(records.filter((r) => !r.loggedOut).length).toBe(0); // zero live connections
       expect(watcher.state).toBe('stopped');
+    });
+  });
+
+  // --- Finding 1 (CRITICAL): sweep client had no 'error' listener ---
+  //
+  // ImapFlow's emitError() ends in an unguarded `this.emit('error', err)`.
+  // On a real Node EventEmitter, emitting 'error' with zero listeners
+  // registered throws synchronously and takes down the whole process. The
+  // fake client factory above now uses a real EventEmitter for `on`/`emit`
+  // specifically so these tests reproduce that behaviour faithfully instead
+  // of a hand-rolled listener map that could never throw either way.
+
+  it('attaches an error listener to the sweep client immediately after connect, so an emitted error does not throw', async () => {
+    await withStore(async (store) => {
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+
+      const sweepRecord = records[0]!;
+      // Before the fix this throws synchronously (real EventEmitter
+      // semantics for an unhandled 'error' event) and would have killed the
+      // process in production — e.g. a NAT/firewall silent-drop socket
+      // timeout on the sweep connection.
+      expect(() => sweepRecord.emit('error', new Error('ETIMEDOUT'))).not.toThrow();
+
+      await watcher.stop();
+    });
+  });
+
+  it('attaches an error listener to the idle client immediately after connect, before mailboxOpen resolves', async () => {
+    await withStore(async (store) => {
+      const { factory, records } = createTrackedClientFactory({ deferMailboxOpen: () => true });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      const startPromise = watcher.start();
+      await flushMicrotasks();
+
+      // Sweep client connects normally; idle client connects and is now
+      // paused inside mailboxOpen('INBOX') — the exact window the finding
+      // called out as unprotected.
+      expect(records.length).toBe(2);
+      const idleRecord = records[1]!;
+
+      expect(() => idleRecord.emit('error', new Error('ETIMEDOUT'))).not.toThrow();
+
+      idleRecord.resolveMailboxOpen();
+      await startPromise;
+      await watcher.stop();
     });
   });
 });

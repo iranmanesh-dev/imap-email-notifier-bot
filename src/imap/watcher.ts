@@ -215,6 +215,18 @@ export class AccountWatcher {
     }
     const client = this.#createClientImpl(this.#opts.account);
     await client.connect();
+    // Attach 'error' immediately after connect(), before any other await.
+    // ImapFlow's emitError() ends in an unguarded `this.emit('error', err)`;
+    // on an EventEmitter with zero 'error' listeners that throws and takes
+    // down the whole process. The socket-timeout path (the classic
+    // NAT/firewall silent-drop failure mode for long-lived IMAP connections)
+    // bypasses ImapFlow's own allowlist of swallowed codes and calls
+    // emitError directly for any non-IDLE connection, so the sweep client
+    // needs this listener just as much as the idle client does. Never logs
+    // more than the account label and error message.
+    client.on('error', (err: Error) => {
+      console.error(`[${this.#opts.account.label}] sweep client error: ${(err as Error).message}`);
+    });
     if (this.#stopped) {
       // stop() ran while client.connect() was in flight. stop() has already
       // logged out whatever #sweepClient held (null, at this point) and
@@ -248,6 +260,15 @@ export class AccountWatcher {
     }
     const client = this.#createClientImpl(this.#opts.account);
     await client.connect();
+    // Attach 'error' immediately after connect(), before any other await
+    // (in particular before mailboxOpen('INBOX')). That call is itself an
+    // await point during which ImapFlow can already emit 'error' (e.g. the
+    // same socket-timeout path described in #connectSweep); leaving the
+    // window between connect() and this listener unprotected would still
+    // let a drop in exactly that window crash the process.
+    client.on('error', (err: Error) => {
+      console.error(`[${this.#opts.account.label}] idler error: ${(err as Error).message}`);
+    });
     if (this.#stopped) {
       // Same race as #connectSweep: stop() ran while we were connecting.
       // Discard this client rather than adopting it and re-arming the
@@ -266,9 +287,6 @@ export class AccountWatcher {
     client.on('exists', () => {
       this.#lastIdleActivity = Date.now();
       void this.triggerSweep();
-    });
-    client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] idler error: ${err.message}`);
     });
 
     this.#idleClient = client;
