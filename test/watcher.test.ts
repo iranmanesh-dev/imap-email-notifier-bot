@@ -1,10 +1,20 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import type { ImapFlow } from 'imapflow';
 import { SeenStore } from '../src/store/seen.js';
 import { AccountWatcher } from '../src/imap/watcher.js';
 import type { Account } from '../src/types.js';
+import { sweep } from '../src/imap/sweeper.js';
+
+vi.mock('../src/imap/sweeper.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/imap/sweeper.js')>();
+  return {
+    ...actual,
+    sweep: vi.fn(),
+  };
+});
 
 const account: Account = {
   label: 'Work',
@@ -22,6 +32,73 @@ function withStore<T>(fn: (store: SeenStore) => Promise<T>): Promise<T> {
     store.close();
     rmSync(dir, { recursive: true, force: true });
   });
+}
+
+beforeEach(() => {
+  vi.mocked(sweep).mockReset();
+  vi.mocked(sweep).mockResolvedValue({ foldersChecked: 1, failures: [] });
+});
+
+// --- Fake client factory for tests that exercise the REAL #connect /
+// #connectSweep / #connectIdle paths (not the deps.connect override), so we
+// can observe connection lifecycle: how many clients are ever created, which
+// ones got logged out, and whether the idle client's 'exists' listener
+// actually fires a sweep.
+
+type FakeClientRecord = {
+  usable: boolean;
+  loggedOut: boolean;
+  connectCalls: number;
+  logoutCalls: number;
+  noopCalls: number;
+  emit: (event: string, ...args: unknown[]) => void;
+};
+
+function createTrackedClientFactory(opts: { failConnect?: () => boolean } = {}) {
+  const records: FakeClientRecord[] = [];
+
+  const factory = vi.fn((_account: Account) => {
+    const listeners = new Map<string, Array<(...args: unknown[]) => void>>();
+    const record: FakeClientRecord = {
+      usable: true,
+      loggedOut: false,
+      connectCalls: 0,
+      logoutCalls: 0,
+      noopCalls: 0,
+      emit: (event, ...args) => {
+        for (const cb of listeners.get(event) ?? []) cb(...args);
+      },
+    };
+
+    const client = {
+      get usable() {
+        return record.usable;
+      },
+      connect: vi.fn(async () => {
+        record.connectCalls += 1;
+        if (opts.failConnect?.()) throw new Error('ECONNREFUSED');
+      }),
+      mailboxOpen: vi.fn(async () => {}),
+      noop: vi.fn(async () => {
+        record.noopCalls += 1;
+      }),
+      logout: vi.fn(async () => {
+        record.loggedOut = true;
+        record.logoutCalls += 1;
+      }),
+      on: vi.fn((event: string, cb: (...args: unknown[]) => void) => {
+        const list = listeners.get(event) ?? [];
+        list.push(cb);
+        listeners.set(event, list);
+        return client;
+      }),
+    };
+
+    records.push(record);
+    return client as unknown as ImapFlow;
+  });
+
+  return { factory, records };
 }
 
 describe('AccountWatcher', () => {
@@ -160,7 +237,12 @@ describe('AccountWatcher', () => {
     });
   });
 
-  it('sweeps again when the idler signals activity', async () => {
+  it('triggerSweep() can be invoked manually and runs the sweep again', async () => {
+    // Renamed from "sweeps again when the idler signals activity": this test
+    // only calls triggerSweep() directly, so it would pass even if the
+    // idler's 'exists' listener were never wired up. The test below,
+    // "the idle client's exists event triggers a real sweep", covers the
+    // actual event wiring using the real (non-overridden) connect path.
     await withStore(async (store) => {
       const runSweep = vi.fn(async () => {});
       const watcher = new AccountWatcher({
@@ -212,7 +294,7 @@ describe('AccountWatcher', () => {
     });
   });
 
-  // --- Bounded reconnect cap (not in the original brief) ---
+  // --- Bounded reconnect cap (round 1) ---
   //
   // isAuthError has a false negative: a server that rejects a bad password
   // with a bare "NO Login failed" (no RFC 5530 response code, no
@@ -296,6 +378,259 @@ describe('AccountWatcher', () => {
       expect(onFatal).not.toHaveBeenCalled();
       expect(watcher.state).not.toBe('connect-failed');
       expect(connect).toHaveBeenCalledTimes(26);
+
+      await watcher.stop();
+    });
+  });
+
+  // --- Round 2: connection-leak and lifecycle coverage ---
+  //
+  // All tests above inject deps.connect/deps.runSweep, so the real bodies of
+  // #connect/#connectSweep/#connectIdle, the idle watchdog, and the
+  // SweepResult branch never execute. The tests below drive the REAL
+  // connection path via an injectable client factory, so a live-connection
+  // leak (or a listener that never fires) actually fails the suite.
+
+  it('opens exactly one sweep client and one idle client on initial connect', async () => {
+    await withStore(async (store) => {
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+
+      expect(records.length).toBe(2);
+      expect(records.filter((r) => !r.loggedOut).length).toBe(2);
+
+      await watcher.stop();
+    });
+  });
+
+  it('replaces only the idle client on a stale-idler cycle, logging out the old one and leaving the sweep client untouched', async () => {
+    vi.useFakeTimers();
+    try {
+      await withStore(async (store) => {
+        const { factory, records } = createTrackedClientFactory();
+
+        const watcher = new AccountWatcher({
+          account,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { createClientImpl: factory, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        expect(records.length).toBe(2);
+        const [sweepRecord, idleRecord] = records;
+
+        idleRecord!.usable = false; // simulate a dropped idle connection
+        await vi.advanceTimersByTimeAsync(9 * 60_000); // one IDLE_REFRESH_MS tick
+
+        expect(records.length).toBe(3); // a replacement idle client was created
+        expect(idleRecord!.loggedOut).toBe(true); // the stale one was logged out
+        expect(sweepRecord!.loggedOut).toBe(false); // sweep client untouched
+        expect(records.filter((r) => !r.loggedOut).length).toBe(2); // still exactly 2 live
+
+        await watcher.stop();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('replaces only the sweep client on a sweep-triggered reconnect, logging out the old one, leaving the idle client untouched, and recovering to ok', async () => {
+    await withStore(async (store) => {
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+      const [sweepRecord, idleRecord] = records;
+
+      sweepRecord!.usable = false; // simulate the sweep connection dying
+      await watcher.triggerSweep();
+
+      expect(records.length).toBe(3); // a replacement sweep client was created
+      expect(sweepRecord!.loggedOut).toBe(true); // the dead one was logged out
+      expect(idleRecord!.loggedOut).toBe(false); // idle client untouched
+      expect(records.filter((r) => !r.loggedOut).length).toBe(2); // still exactly 2 live
+      expect(watcher.state).toBe('ok'); // recovers instead of staying 'reconnecting'
+
+      await watcher.stop();
+    });
+  });
+
+  it('stops all further connection attempts after reaching connect-failed, even across an idle-watchdog tick', async () => {
+    vi.useFakeTimers();
+    try {
+      await withStore(async (store) => {
+        const failFlag = { value: false };
+        const { factory, records } = createTrackedClientFactory({ failConnect: () => failFlag.value });
+        const onFatal = vi.fn(async () => {});
+
+        const watcher = new AccountWatcher({
+          account,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal,
+          deps: { createClientImpl: factory, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        expect(watcher.state).toBe('ok');
+
+        records[0]!.usable = false; // sweep connection dies
+        failFlag.value = true; // every future connect attempt now fails
+
+        await watcher.triggerSweep(); // discovers the broken client, retries to the cap
+
+        expect(watcher.state).toBe('connect-failed');
+        expect(onFatal).toHaveBeenCalledTimes(1);
+
+        const factoryCallsAtTerminal = factory.mock.calls.length;
+
+        await vi.advanceTimersByTimeAsync(9 * 60_000); // one idle-watchdog period
+
+        expect(factory.mock.calls.length).toBe(factoryCallsAtTerminal); // no further attempts
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('stop() clears the idle watchdog timer', async () => {
+    await withStore(async (store) => {
+      const { factory } = createTrackedClientFactory();
+      const clearIntervalSpy = vi.spyOn(global, 'clearInterval');
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+      clearIntervalSpy.mockClear();
+
+      await watcher.stop();
+
+      // Both the sweep-interval timer and the idle-watchdog timer must be cleared.
+      expect(clearIntervalSpy).toHaveBeenCalledTimes(2);
+
+      clearIntervalSpy.mockRestore();
+    });
+  });
+
+  it("the idle client's exists event triggers a real sweep", async () => {
+    await withStore(async (store) => {
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+      expect(sweep).toHaveBeenCalledTimes(1); // the initial sweep from start()
+
+      const idleRecord = records[1]!;
+      idleRecord.emit('exists');
+      // triggerSweep() serializes via the same queue as the fire-and-forget
+      // call the 'exists' listener makes, so awaiting this call guarantees
+      // the emitted sweep has already run by the time we assert.
+      await watcher.triggerSweep();
+
+      expect(sweep).toHaveBeenCalledTimes(3); // 1 initial + 1 from 'exists' + 1 explicit
+
+      await watcher.stop();
+    });
+  });
+
+  it('reconnects the sweep client when the real sweep reports every folder failed', async () => {
+    await withStore(async (store) => {
+      vi.mocked(sweep).mockResolvedValueOnce({
+        foldersChecked: 0,
+        failures: [{ folder: 'INBOX', message: 'boom' }],
+      });
+
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+
+      const sweepRecord = records[0]!;
+      expect(sweepRecord.loggedOut).toBe(true); // all-fail result drove a reconnect
+      expect(records.length).toBe(3); // replacement sweep client created
+      expect(watcher.state).toBe('ok');
+
+      await watcher.stop();
+    });
+  });
+
+  it('does not reconnect when the real sweep reports only a partial folder failure', async () => {
+    await withStore(async (store) => {
+      vi.mocked(sweep).mockResolvedValueOnce({
+        foldersChecked: 2,
+        failures: [{ folder: 'Archive', message: 'boom' }],
+      });
+
+      const { factory, records } = createTrackedClientFactory();
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { createClientImpl: factory, sleep: async () => {} },
+      });
+
+      await watcher.start();
+
+      const sweepRecord = records[0]!;
+      expect(sweepRecord.loggedOut).toBe(false); // partial failure: no reconnect
+      expect(records.length).toBe(2); // no replacement client
+      expect(watcher.state).toBe('ok');
 
       await watcher.stop();
     });

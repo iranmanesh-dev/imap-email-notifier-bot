@@ -1,4 +1,4 @@
-import { ImapFlow } from 'imapflow';
+import type { ImapFlow } from 'imapflow';
 import { createClient, imapSweepDeps, isAuthError } from './client.js';
 import { sweep } from './sweeper.js';
 import type { SeenStore } from '../store/seen.js';
@@ -17,6 +17,13 @@ export type WatcherTestDeps = {
   connect?: () => Promise<void>;
   disconnect?: () => Promise<void>;
   sleep?: (ms: number) => Promise<void>;
+  /**
+   * Overrides how a raw IMAP client is constructed. Defaults to the real
+   * createClient. Lets tests observe the actual connection lifecycle
+   * (#connectSweep / #connectIdle / the idle watchdog) with fake clients,
+   * instead of only exercising deps.connect/deps.runSweep short-circuits.
+   */
+  createClientImpl?: (account: Account) => ImapFlow;
 };
 
 export type WatcherOptions = {
@@ -50,12 +57,14 @@ const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms))
 export class AccountWatcher {
   readonly #opts: WatcherOptions;
   readonly #sleep: (ms: number) => Promise<void>;
+  readonly #createClientImpl: (account: Account) => ImapFlow;
 
   #state: WatcherState = 'starting';
   #stopped = false;
   #sweepChain: Promise<void> = Promise.resolve();
   #timer: NodeJS.Timeout | null = null;
   #idleTimer: NodeJS.Timeout | null = null;
+  #idleHealthInFlight = false;
   #sweepClient: ImapFlow | null = null;
   #idleClient: ImapFlow | null = null;
   #lastIdleActivity = Date.now();
@@ -64,6 +73,7 @@ export class AccountWatcher {
   constructor(opts: WatcherOptions) {
     this.#opts = opts;
     this.#sleep = opts.deps?.sleep ?? defaultSleep;
+    this.#createClientImpl = opts.deps?.createClientImpl ?? createClient;
   }
 
   get state(): WatcherState {
@@ -75,7 +85,7 @@ export class AccountWatcher {
   }
 
   async start(): Promise<void> {
-    const connected = await this.#connectWithRetry();
+    const connected = await this.#connectWithRetry(() => this.#connect());
     if (!connected) return;
 
     this.#state = 'ok';
@@ -97,9 +107,8 @@ export class AccountWatcher {
   async stop(): Promise<void> {
     this.#stopped = true;
     if (this.#timer) clearInterval(this.#timer);
-    if (this.#idleTimer) clearInterval(this.#idleTimer);
+    this.#stopIdleWatchdog();
     this.#timer = null;
-    this.#idleTimer = null;
 
     const disconnect = this.#opts.deps?.disconnect;
     if (disconnect) {
@@ -113,16 +122,26 @@ export class AccountWatcher {
     this.#state = 'stopped';
   }
 
-  async #connectWithRetry(): Promise<boolean> {
+  /**
+   * Generic connect-with-retry loop. `connectFn` decides WHAT to (re)connect
+   * — the initial full connect, just the sweep client, or just the idle
+   * client — while this method owns the shared concerns: auth-is-fatal,
+   * the consecutive-failure cap, and capped/jittered backoff between
+   * attempts. `#consecutiveFailures` is an instance field (not local to this
+   * call) so it accumulates across separate reconnect episodes and is only
+   * reset by an actual successful connect, anywhere.
+   */
+  async #connectWithRetry(connectFn: () => Promise<void>): Promise<boolean> {
     let attempt = 0;
     while (!this.#stopped) {
       try {
-        await this.#connect();
+        await connectFn();
         this.#consecutiveFailures = 0;
         return true;
       } catch (err) {
         if (isAuthError(err)) {
           this.#state = 'auth-failed';
+          this.#stopIdleWatchdog();
           const message = `Authentication failed for ${this.#opts.account.label}. Check the mailbox credentials; this account is now stopped.`;
           console.error(`[${this.#opts.account.label}] ${message}`);
           await this.#opts.onFatal(this.#opts.account, message);
@@ -136,6 +155,7 @@ export class AccountWatcher {
 
         if (this.#consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
           this.#state = 'connect-failed';
+          this.#stopIdleWatchdog();
           const message = `Account ${this.#opts.account.label} gave up after ${this.#consecutiveFailures} consecutive connection failures; check credentials or host settings.`;
           console.error(`[${this.#opts.account.label}] ${message}`);
           await this.#opts.onFatal(this.#opts.account, message);
@@ -152,62 +172,128 @@ export class AccountWatcher {
     return false;
   }
 
+  /** Initial connect only: establishes both the sweep and idle clients. */
   async #connect(): Promise<void> {
     const override = this.#opts.deps?.connect;
     if (override) {
       await override();
       return;
     }
+    await this.#connectSweep();
+    await this.#connectIdle();
+  }
 
-    this.#sweepClient = createClient(this.#opts.account);
-    await this.#sweepClient.connect();
+  /**
+   * (Re)establishes the sweep client only, never touching the idle client.
+   * Logs out whatever sweep client is currently held before replacing it —
+   * every call site that reconnects the sweep client goes through here, so
+   * there is never a moment where two sweep clients are alive at once.
+   */
+  async #connectSweep(): Promise<void> {
+    // Tests may reconnect only via deps.connect (no createClientImpl at
+    // all); honor that override here too, since #connectSweep can be
+    // invoked directly (from #runSweep's catch) without going through
+    // #connect() first.
+    const override = this.#opts.deps?.connect;
+    if (override) {
+      await override();
+      return;
+    }
+    if (this.#sweepClient) {
+      await this.#sweepClient.logout().catch(() => undefined);
+      this.#sweepClient = null;
+    }
+    const client = this.#createClientImpl(this.#opts.account);
+    await client.connect();
+    this.#sweepClient = client;
+  }
 
-    this.#idleClient = createClient(this.#opts.account);
-    await this.#idleClient.connect();
-    await this.#idleClient.mailboxOpen('INBOX');
+  /**
+   * (Re)establishes the idle client only, never touching the sweep client.
+   * Same orphan-prevention rule as #connectSweep: log out the old client
+   * before the new one replaces it. Also (re)arms the idle watchdog, since
+   * every idle client — fresh or replaced — needs its own watchdog cycle.
+   */
+  async #connectIdle(): Promise<void> {
+    // Same reasoning as #connectSweep: honor deps.connect when
+    // #connectIdle is invoked directly (from #checkIdleHealth) without
+    // going through #connect() first.
+    const override = this.#opts.deps?.connect;
+    if (override) {
+      await override();
+      return;
+    }
+    if (this.#idleClient) {
+      await this.#idleClient.logout().catch(() => undefined);
+      this.#idleClient = null;
+    }
+    const client = this.#createClientImpl(this.#opts.account);
+    await client.connect();
+    await client.mailboxOpen('INBOX');
 
     // ImapFlow idles automatically on an open mailbox and emits `exists`
     // when the server reports new messages. That is our early-sweep signal.
-    this.#idleClient.on('exists', () => {
+    client.on('exists', () => {
       this.#lastIdleActivity = Date.now();
       void this.triggerSweep();
     });
-    this.#idleClient.on('error', (err: Error) => {
+    client.on('error', (err: Error) => {
       console.error(`[${this.#opts.account.label}] idler error: ${err.message}`);
     });
 
+    this.#idleClient = client;
     this.#lastIdleActivity = Date.now();
     this.#startIdleWatchdog();
   }
 
   #startIdleWatchdog(): void {
-    if (this.#idleTimer) clearInterval(this.#idleTimer);
+    this.#stopIdleWatchdog();
     this.#idleTimer = setInterval(() => {
       void this.#checkIdleHealth();
     }, IDLE_REFRESH_MS);
   }
 
-  async #checkIdleHealth(): Promise<void> {
-    if (this.#stopped) return;
-    const silent = Date.now() - this.#lastIdleActivity;
-    const alive = this.#idleClient?.usable === true;
+  #stopIdleWatchdog(): void {
+    if (this.#idleTimer) clearInterval(this.#idleTimer);
+    this.#idleTimer = null;
+  }
 
-    if (alive && silent < IDLE_WATCHDOG_MS) {
-      // Touch the connection so the server and any NAT in between keep it open.
-      await this.#idleClient?.noop().catch(() => undefined);
-      this.#lastIdleActivity = Date.now();
+  async #checkIdleHealth(): Promise<void> {
+    // Terminal states must stop the idle cycle entirely: otherwise a
+    // known-bad-credentials account would keep issuing a fresh LOGIN every
+    // IDLE_REFRESH_MS forever, which is exactly the provider-IP-block
+    // scenario the connection cap exists to prevent. #stopIdleWatchdog() at
+    // the point of transition into these states (see #connectWithRetry)
+    // means this timer should already be cleared and not fire again — this
+    // check is the second line of defense in case a tick is already queued.
+    if (this.#stopped || this.#state === 'auth-failed' || this.#state === 'connect-failed') {
       return;
     }
+    // Re-entrancy guard: a slow reconnect must not overlap with the next tick.
+    if (this.#idleHealthInFlight) return;
+    this.#idleHealthInFlight = true;
 
-    console.error(`[${this.#opts.account.label}] idler stale; reconnecting it`);
-    await this.#idleClient?.logout().catch(() => undefined);
-    this.#idleClient = null;
     try {
-      await this.#connect();
-    } catch (err) {
-      console.error(
-        `[${this.#opts.account.label}] idler reconnect failed: ${(err as Error).message}`
-      );
+      const silent = Date.now() - this.#lastIdleActivity;
+      const alive = this.#idleClient?.usable === true;
+
+      if (alive && silent < IDLE_WATCHDOG_MS) {
+        // Touch the connection so the server and any NAT in between keep it open.
+        await this.#idleClient?.noop().catch(() => undefined);
+        this.#lastIdleActivity = Date.now();
+        return;
+      }
+
+      console.error(`[${this.#opts.account.label}] idler stale; reconnecting it`);
+      try {
+        await this.#connectIdle();
+      } catch (err) {
+        console.error(
+          `[${this.#opts.account.label}] idler reconnect failed: ${(err as Error).message}`
+        );
+      }
+    } finally {
+      this.#idleHealthInFlight = false;
     }
   }
 
@@ -251,13 +337,29 @@ export class AccountWatcher {
           );
         }
       }
-      this.#state = 'ok';
+      // Gate on !#stopped: stop() does not await this sweep chain, so an
+      // in-flight sweep can still be running when stop() flips #state to
+      // 'stopped'. Without this guard a straggling write here would clobber
+      // that terminal state and a shut-down account would keep reporting
+      // as 'ok' or 'reconnecting'.
+      if (!this.#stopped) this.#state = 'ok';
     } catch (err) {
-      this.#state = 'reconnecting';
+      if (!this.#stopped) this.#state = 'reconnecting';
       console.error(`[${this.#opts.account.label}] sweep failed: ${(err as Error).message}`);
-      await this.#sweepClient?.logout().catch(() => undefined);
-      this.#sweepClient = null;
-      await this.#connectWithRetry();
+      // Only the sweep client is suspect here; #connectSweep leaves the
+      // idle client (and its watchdog) completely alone.
+      const reconnected = await this.#connectWithRetry(() => this.#connectSweep());
+      // A reconnect-only success does not itself prove a sweep will
+      // succeed, but it does mean the account is no longer degraded from
+      // the caller's point of view: the next timer tick or idle signal
+      // will run a real sweep against the fresh client. Reporting 'ok'
+      // here (instead of leaving it stuck at 'reconnecting' until that
+      // next sweep) avoids a false "still degraded" reading that could
+      // trip an external healthcheck/restart policy on nothing more than
+      // a transient blip that already recovered.
+      if (reconnected && !this.#stopped) {
+        this.#state = 'ok';
+      }
     }
   }
 }
