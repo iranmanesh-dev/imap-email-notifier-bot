@@ -409,14 +409,36 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(started).toEqual(['Live']);
     expect(registry.has('Live')).toBe(true);
 
+    // Seed real per-account state in the SeenStore, as production would have
+    // accumulated it from real sweeps, so purgeAccount has something genuine
+    // to prove it purges. A fake watcher factory never calls
+    // setFolderState/markSeen itself, so without this seeding the assertions
+    // below would be vacuously true even if purgeAccount did nothing.
+    store.setFolderState('Live', 'INBOX', { uidNext: 42, uidValidity: 7 });
+    store.markSeen('Live', '<live-message@example.com>');
+    expect(store.getFolderState('Live', 'INBOX')).toEqual({ uidNext: 42, uidValidity: 7 });
+    expect(store.hasSeen('Live', '<live-message@example.com>')).toBe(true);
+
+    // A second, untouched account proves purgeAccount('Live') is scoped to
+    // its own label and does not collaterally wipe another account's state.
+    store.setFolderState('Other', 'INBOX', { uidNext: 99, uidValidity: 3 });
+    store.markSeen('Other', '<other-message@example.com>');
+
     await registry.remove('Live');
     mb.remove('Live');
-    store.purgeAccount('Live');
+    const purged = store.purgeAccount('Live');
 
     expect(stopped).toEqual(['Live']);
     expect(registry.has('Live')).toBe(false);
     expect(mb.get('Live')).toBeNull();
+    // Non-zero purge count: a no-op purgeAccount could not satisfy this.
+    expect(purged).toBeGreaterThan(0);
     expect(store.getFolderState('Live', 'INBOX')).toBeNull();
+    expect(store.hasSeen('Live', '<live-message@example.com>')).toBe(false);
+
+    // Cross-account isolation: 'Other' is untouched by purging 'Live'.
+    expect(store.getFolderState('Other', 'INBOX')).toEqual({ uidNext: 99, uidValidity: 3 });
+    expect(store.hasSeen('Other', '<other-message@example.com>')).toBe(true);
 
     mb.close();
   }, 60_000);
