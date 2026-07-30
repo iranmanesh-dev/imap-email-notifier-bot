@@ -1,7 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
-import { createEmailHandler, shutdown, startAllWatchers, armPruneTimer } from '../src/index.js';
-import type { NormalizedEmail } from '../src/types.js';
+import {
+  createEmailHandler,
+  shutdown,
+  restoreMailboxes,
+  startDaemon,
+  onReceiverStopped,
+  armPruneTimer,
+  withShutdownTimeout,
+  ONBEFORE_EXIT_TIMEOUT_MS,
+} from '../src/index.js';
+import { WatcherRegistry } from '../src/imap/registry.js';
+import { FatalTelegramError } from '../src/telegram/receiver.js';
+import type { NormalizedEmail, Account } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
 describe('buildHealthReport', () => {
@@ -27,8 +38,25 @@ describe('buildHealthReport', () => {
     expect(buildHealthReport([{ label: 'Work', state: 'connect-failed' }]).status).toBe('degraded');
   });
 
-  it('reports degraded with no accounts at all', () => {
-    expect(buildHealthReport([]).status).toBe('degraded');
+  it('reports ok while a mailbox is still starting up (initialising is not degraded)', () => {
+    // The registry now surfaces in-flight adds as 'starting'. Without this,
+    // a container that just booted with several mailboxes still connecting
+    // would answer 503 for its entire startup window.
+    const report = buildHealthReport([
+      { label: 'Work', state: 'ok' },
+      { label: 'Personal', state: 'starting' },
+    ]);
+    expect(report.status).toBe('ok');
+  });
+
+  it('still reports degraded once a starting mailbox begins failing', () => {
+    expect(buildHealthReport([{ label: 'Work', state: 'reconnecting' }]).status).toBe('degraded');
+  });
+
+  it('reports ok when no mailboxes are configured yet (idle, not unhealthy)', () => {
+    const report = buildHealthReport([]);
+    expect(report.status).toBe('ok');
+    expect(report.accounts).toEqual([]);
   });
 });
 
@@ -274,6 +302,151 @@ describe('shutdown', () => {
     expect(exit).toHaveBeenCalledWith(0);
   });
 
+  it('closes the mailbox store after the watchers stop and the health server closes, not from within onBeforeExit (Finding 4)', async () => {
+    // Regression: closing the mailbox store from inside onBeforeExit could
+    // race an in-flight command (e.g. mid-probeMailbox) that resumes and
+    // then calls mailboxes.add/remove/get against an already-closed
+    // database. Deferring the close to alongside store.close() gives that
+    // command the longest practical window to finish first.
+    const order: string[] = [];
+    const watcher = fakeWatcher('A', async () => {
+      order.push('watcher-stop');
+    });
+    const health = {
+      close: vi.fn(async () => {
+        order.push('health-close');
+      }),
+    };
+    const store = {
+      close: vi.fn(() => {
+        order.push('store-close');
+      }),
+    };
+    const mailboxStore = {
+      close: vi.fn(() => {
+        order.push('mailboxStore-close');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', {
+      watchers: [watcher],
+      pruneTimer,
+      health,
+      store,
+      mailboxStore,
+      exit,
+      onBeforeExit: async () => {
+        order.push('onBeforeExit');
+      },
+    });
+
+    expect(order).toEqual([
+      'onBeforeExit',
+      'watcher-stop',
+      'health-close',
+      'store-close',
+      'mailboxStore-close',
+    ]);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still exits 0 and still closes store when mailboxStore fails to close', async () => {
+    const watcher = fakeWatcher('A', async () => {});
+    const health = { close: vi.fn(async () => {}) };
+    const store = { close: vi.fn(() => {}) };
+    const mailboxStore = {
+      close: vi.fn(() => {
+        throw new Error('db already closed');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, mailboxStore, exit });
+
+    expect(store.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('honours a non-zero exitCode while still running the whole cleanup sequence', async () => {
+    // Final review, finding 9: a 401 from Telegram called process.exit(1)
+    // directly, skipping every watcher stop, both SQLite closes (so no clean
+    // WAL checkpoint) and the health server close — the clean-shutdown
+    // discipline this branch spent two rounds building. The fatal path has
+    // to go through here, which means shutdown must be able to exit non-zero.
+    const order: string[] = [];
+    const watcher = fakeWatcher('A', async () => {
+      order.push('watcher-stop');
+    });
+    const health = { close: vi.fn(async () => { order.push('health-close'); }) };
+    const store = { close: vi.fn(() => { order.push('store-close'); }) };
+    const mailboxStore = { close: vi.fn(() => { order.push('mailboxStore-close'); }) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('fatal Telegram error', {
+      watchers: [watcher],
+      pruneTimer,
+      health,
+      store,
+      mailboxStore,
+      exit,
+      exitCode: 1,
+    });
+
+    expect(order).toEqual(['watcher-stop', 'health-close', 'store-close', 'mailboxStore-close']);
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still exits with the requested non-zero code when every cleanup step throws', async () => {
+    const watcher = fakeWatcher('A', async () => {
+      throw new Error('logout failed');
+    });
+    const health = { close: vi.fn(async () => { throw new Error('EPIPE'); }) };
+    const store = { close: vi.fn(() => { throw new Error('disk I/O error'); }) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('fatal Telegram error', {
+      watchers: [watcher], pruneTimer, health, store, exit, exitCode: 1,
+    });
+
+    expect(exit).toHaveBeenCalledWith(1);
+  });
+
+  it('still reaches exit(0) when a caller-supplied onBeforeExit never settles, even with no internal bound of its own (Finding 5)', async () => {
+    // shutdown()'s own bound around onBeforeExit must hold regardless of
+    // whether the callback bounds itself — belt and braces with the
+    // shipped closure's internal withShutdownTimeout(receiverDone, ...).
+    vi.useFakeTimers();
+    try {
+      const watcher = fakeWatcher('A', async () => {});
+      const health = { close: vi.fn(async () => {}) };
+      const store = { close: vi.fn(() => {}) };
+      const exit = vi.fn();
+      const pruneTimer = setInterval(() => {}, 1_000_000);
+
+      const done = shutdown('SIGTERM', {
+        watchers: [watcher],
+        pruneTimer,
+        health,
+        store,
+        exit,
+        onBeforeExit: () => new Promise<void>(() => {}),
+      });
+
+      await vi.advanceTimersByTimeAsync(ONBEFORE_EXIT_TIMEOUT_MS);
+      await done;
+
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('always exits 0, never rejects, and clears the prune timer, even when everything (including the logger) throws', async () => {
     const watcher = fakeWatcher('A', async () => {
       throw new Error('logout failed');
@@ -305,6 +478,65 @@ describe('shutdown', () => {
 
     expect(exit).toHaveBeenCalledWith(0);
     expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('still reaches exit(0) when onBeforeExit awaits a receiver promise that never settles, thanks to withShutdownTimeout bounding the wait', async () => {
+    // Regression for Finding 1: receiverAbort.abort() cancels the in-flight
+    // fetch, but a non-abortable backoff sleep or an in-flight probeMailbox
+    // call (mid onUpdate) can still leave receiverDone unsettled well past
+    // any reasonable shutdown window. onBeforeExit must not block shutdown
+    // on that indefinitely.
+    vi.useFakeTimers();
+    try {
+      const watcher = fakeWatcher('A', async () => {});
+      const health = { close: vi.fn(async () => {}) };
+      const store = { close: vi.fn(() => {}) };
+      const exit = vi.fn();
+      const pruneTimer = setInterval(() => {}, 1_000_000);
+      const neverSettles = new Promise<void>(() => {});
+
+      const done = shutdown('SIGTERM', {
+        watchers: [watcher],
+        pruneTimer,
+        health,
+        store,
+        exit,
+        onBeforeExit: () => withShutdownTimeout(neverSettles, 2000),
+      });
+
+      await vi.advanceTimersByTimeAsync(2000);
+      await done;
+
+      expect(store.close).toHaveBeenCalledTimes(1);
+      expect(exit).toHaveBeenCalledWith(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe('withShutdownTimeout', () => {
+  it('resolves once the promise settles, without waiting for the timeout, and logs nothing', async () => {
+    const logger = { log: vi.fn(), error: vi.fn() };
+    await withShutdownTimeout(Promise.resolve('done'), 2000, logger);
+    expect(logger.error).not.toHaveBeenCalled();
+  });
+
+  it('gives up and resolves anyway once the timeout elapses, and logs a warning', async () => {
+    vi.useFakeTimers();
+    try {
+      const logger = { log: vi.fn(), error: vi.fn() };
+      const neverSettles = new Promise<void>(() => {});
+
+      const done = withShutdownTimeout(neverSettles, 2000, logger);
+      await vi.advanceTimersByTimeAsync(2000);
+      await expect(done).resolves.toBeUndefined();
+
+      expect(logger.error).toHaveBeenCalledTimes(1);
+      expect(logger.error.mock.calls[0]?.[0]).toContain('2000ms');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
@@ -349,24 +581,24 @@ describe('armPruneTimer', () => {
   });
 });
 
-describe('startAllWatchers', () => {
-  it('starts every watcher (including ones after a failing one) and never throws, even when the logger used to report a failed start itself throws (e.g. EPIPE)', async () => {
-    // This is the Finding-5 regression: main() previously logged a failed
-    // watcher start via a raw console.error inside a Promise.allSettled
-    // forEach. If that raw call threw (EPIPE on closed stdout), the throw
-    // propagated synchronously out of the forEach and out of main() itself,
-    // hitting the bottom-level `.catch` -> process.exit(1) and taking down
-    // every already-started healthy watcher — before SIGTERM/SIGINT
-    // handlers were even registered. Proving this function resolves
-    // (instead of throwing) when its logger explodes is what guarantees
-    // main()'s subsequent statements — including registering the signal
-    // handlers — are still reached, since main() is straight-line
-    // sequential code with nothing else that could stop it there.
-    const healthy = { label: 'Healthy', start: vi.fn(async (): Promise<void> => {}) };
-    const failing = {
-      label: 'Failing',
-      start: vi.fn(async (): Promise<void> => {
-        throw new Error('connect-failed');
+function testAccount(label: string): Account {
+  return { label, host: 'h', port: 993, user: 'u', pass: 'p', secure: true };
+}
+
+describe('restoreMailboxes', () => {
+  it('starts every mailbox (including ones after a failing one) and never throws, even when the logger used to report a failure itself throws (e.g. EPIPE)', async () => {
+    // This is the Finding-5 regression, inherited from startAllWatchers:
+    // main() previously logged a failed watcher start via a raw
+    // console.error inside a Promise.allSettled forEach. If that raw call
+    // threw (EPIPE on closed stdout), the throw propagated synchronously out
+    // of the forEach and out of main() itself, hitting the bottom-level
+    // `.catch` -> process.exit(1) and taking down every already-started
+    // healthy watcher — before SIGTERM/SIGINT handlers were even registered.
+    const started: string[] = [];
+    const registry = {
+      add: vi.fn(async (a: Account) => {
+        if (a.label === 'Failing') throw new Error('connect-failed');
+        started.push(a.label);
       }),
     };
     const throwingLogger = {
@@ -378,24 +610,234 @@ describe('startAllWatchers', () => {
       }),
     };
 
-    await expect(startAllWatchers([healthy, failing], throwingLogger)).resolves.toBeUndefined();
+    await expect(
+      restoreMailboxes({
+        labels: () => ['Failing', 'Healthy'],
+        get: (label) => testAccount(label),
+        registry,
+        alert: async () => {},
+        logger: throwingLogger,
+      })
+    ).resolves.toBeUndefined();
 
-    expect(healthy.start).toHaveBeenCalledTimes(1);
-    expect(failing.start).toHaveBeenCalledTimes(1);
-    // The attempt to log the failure happened (and was swallowed) rather
-    // than being skipped or crashing the function outright.
+    expect(registry.add).toHaveBeenCalledTimes(2);
+    // One failing mailbox does not stop the other from being started.
+    expect(started).toEqual(['Healthy']);
     expect(throwingLogger.error).toHaveBeenCalledTimes(1);
   });
 
-  it('logs nothing when every watcher starts successfully', async () => {
-    const a = { label: 'A', start: vi.fn(async (): Promise<void> => {}) };
-    const b = { label: 'B', start: vi.fn(async (): Promise<void> => {}) };
+  it('restores concurrently rather than serially, so one slow mailbox cannot delay the others', async () => {
+    // The regression this guards: the restore loop used to `await
+    // registry.add(...)` per mailbox in sequence, and registry.add awaits
+    // AccountWatcher.start() -> #connectWithRetry, which sleeps for up to
+    // ~58 minutes before giving up on a single bad mailbox.
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    const registry = {
+      add: async (a: Account) => {
+        if (a.label === 'Slow') await blocked;
+        started.push(a.label);
+      },
+    };
+
+    const done = restoreMailboxes({
+      labels: () => ['Slow', 'Fast'],
+      get: (label) => testAccount(label),
+      registry,
+      alert: async () => {},
+      logger: { log: vi.fn(), error: vi.fn() },
+    });
+
+    await vi.waitFor(() => {
+      expect(started).toEqual(['Fast']);
+    });
+    release();
+    await done;
+    expect(started.sort()).toEqual(['Fast', 'Slow']);
+  });
+
+  it('logs loudly and sends a Telegram alert when a mailbox cannot be decrypted, without touching the others', async () => {
+    const alert = vi.fn(async () => {});
+    const logger = { log: vi.fn(), error: vi.fn() };
+    const started: string[] = [];
+
+    await restoreMailboxes({
+      labels: () => ['Broken', 'Fine'],
+      get: (label) => {
+        if (label === 'Broken') throw new Error('decrypt failed: bad key');
+        return testAccount(label);
+      },
+      registry: { add: async (a: Account) => { started.push(a.label); } },
+      alert,
+      logger,
+    });
+
+    expect(started).toEqual(['Fine']);
+    expect(logger.error.mock.calls[0]?.[0]).toContain('Broken');
+    expect(logger.error.mock.calls[0]?.[0]).toContain('decrypt failed');
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0]?.[0]).toContain('Broken');
+    expect(alert.mock.calls[0]?.[0]).toContain('MASTER_KEY');
+  });
+});
+
+describe('onReceiverStopped', () => {
+  it('routes a fatal Telegram error into the shutdown callback instead of exiting on the spot', () => {
+    const fatal = vi.fn();
     const logger = { log: vi.fn(), error: vi.fn() };
 
-    await startAllWatchers([a, b], logger);
+    onReceiverStopped(new FatalTelegramError('401 Unauthorized: bot token is invalid'), {
+      fatal,
+      logger,
+    });
 
-    expect(a.start).toHaveBeenCalledTimes(1);
-    expect(b.start).toHaveBeenCalledTimes(1);
-    expect(logger.error).not.toHaveBeenCalled();
+    expect(fatal).toHaveBeenCalledTimes(1);
+    expect(String(fatal.mock.calls[0]?.[0])).toMatch(/telegram/i);
+    expect(logger.error.mock.calls[0]?.[0]).toContain('401');
+  });
+
+  it('logs but does not request shutdown for an ordinary receiver failure', () => {
+    const fatal = vi.fn();
+    const logger = { log: vi.fn(), error: vi.fn() };
+
+    onReceiverStopped(new Error('socket hang up'), { fatal, logger });
+
+    expect(fatal).not.toHaveBeenCalled();
+    expect(logger.error.mock.calls[0]?.[0]).toContain('socket hang up');
+  });
+
+  it('never throws, even when the logger does', () => {
+    const throwingLogger = {
+      log: vi.fn(() => { throw new Error('EPIPE'); }),
+      error: vi.fn(() => { throw new Error('EPIPE'); }),
+    };
+    expect(() =>
+      onReceiverStopped(new FatalTelegramError('401'), { fatal: vi.fn(), logger: throwingLogger })
+    ).not.toThrow();
+  });
+});
+
+describe('startDaemon', () => {
+  // CRITICAL regression (final review, finding 1): the restore loop ran
+  // BEFORE startHealthServer and BEFORE the Telegram receiver, and awaited
+  // registry.add(account) per mailbox in sequence. registry.add awaits
+  // AccountWatcher.start() -> #connectWithRetry, which retries up to 20
+  // times with backoff capped at 300s — roughly 58 minutes of sleeping for
+  // ONE bad mailbox, on top of ImapFlow's 90s per-attempt connect timeout.
+  // Everything after it was blocked: the receiver, the health server, the
+  // prune timer, and the SIGTERM handler. With the Dockerfile's
+  // --start-period=45s --interval=30s --retries=3, the health port was still
+  // unbound at ~2m15s, so the orchestrator restarted the container — forever.
+  // Every other mailbox stopped delivering, and the operator could not even
+  // /remove the bad one because the receiver never started.
+
+  it('binds the health server and starts the receiver before any watcher start() is awaited', async () => {
+    const order: string[] = [];
+    let healthStatusWhenWatcherStarted: number | null = null;
+    // Port 0 (kernel-assigned, read back from the bound server) rather than a
+    // port picked in advance: pre-picking one races the other test workers,
+    // and a bind failure inside startDaemon would take the worker down with
+    // startHealthServer's default process.exit.
+    let healthPort = 0;
+
+    // A real WatcherRegistry and the real restoreMailboxes, so the assertion
+    // covers the actual production seam rather than a stand-in for it. Only
+    // the watcher's IMAP work is faked — and it is faked as the failure mode
+    // that caused the outage: a start() that never resolves.
+    const registry = new WatcherRegistry((a) => ({
+      label: a.label,
+      state: 'starting' as const,
+      async start() {
+        order.push('watcher-start');
+        const res = await fetch(`http://127.0.0.1:${healthPort}/healthz`);
+        healthStatusWhenWatcherStarted = res.status;
+        await new Promise<void>(() => {}); // never resolves, like a 58-minute retry loop
+      },
+      async stop() {},
+    }));
+
+    const daemon = await startDaemon({
+      healthPort: 0,
+      states: () => registry.states(),
+      startReceiver: () => {
+        order.push('receiver');
+        return new Promise<void>(() => {}); // a long-poll loop never settles either
+      },
+      // `health` is handed in already bound — that is the invariant under
+      // test, and reading its port here is what makes the probe below exact.
+      restore: (health) => {
+        healthPort = health.port;
+        return restoreMailboxes({
+          labels: () => ['Work'],
+          get: (label) => testAccount(label),
+          registry,
+          alert: async () => {},
+          logger: { log: vi.fn(), error: vi.fn() },
+        });
+      },
+      armPrune: () => setInterval(() => {}, 1_000_000),
+    });
+
+    // startDaemon resolved at all: boot is no longer serialized behind a
+    // watcher that will never come up. Wait for the probe issued from inside
+    // start() to come back, not merely for start() to have been entered.
+    await vi.waitFor(() => {
+      expect(healthStatusWhenWatcherStarted).not.toBeNull();
+    });
+
+    expect(order).toEqual(['receiver', 'watcher-start']);
+    // The load-bearing assertion: at the moment the first watcher start()
+    // was entered, /healthz was already answering.
+    expect(healthStatusWhenWatcherStarted).toBe(200);
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
+  });
+
+  it('arms the prune timer before the restore starts, so a hanging mailbox cannot postpone retention enforcement', async () => {
+    const order: string[] = [];
+
+    const daemon = await startDaemon({
+      healthPort: 0,
+      states: () => [],
+      startReceiver: () => new Promise<void>(() => {}),
+      restore: async () => {
+        order.push('restore');
+        await new Promise<void>(() => {});
+      },
+      armPrune: () => {
+        order.push('prune');
+        return setInterval(() => {}, 1_000_000);
+      },
+    });
+
+    expect(order).toEqual(['prune', 'restore']);
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
+  });
+
+  it('does not reject when the detached restore rejects outright', async () => {
+    const logger = { log: vi.fn(), error: vi.fn() };
+
+    const daemon = await startDaemon({
+      healthPort: 0,
+      states: () => [],
+      startReceiver: () => Promise.resolve(),
+      restore: () => Promise.reject(new Error('restore exploded')),
+      armPrune: () => setInterval(() => {}, 1_000_000),
+      logger,
+    });
+
+    await expect(daemon.restoreDone).resolves.toBeUndefined();
+    expect(logger.error.mock.calls.some((c) => String(c[0]).includes('restore exploded'))).toBe(
+      true
+    );
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
   });
 });

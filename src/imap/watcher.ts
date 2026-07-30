@@ -1,6 +1,7 @@
 import type { ImapFlow } from 'imapflow';
 import { createClient, imapSweepDeps, isAuthError } from './client.js';
 import { sweep, errorMessage } from './sweeper.js';
+import { scrubSecret } from '../scrub.js';
 import type { SeenStore } from '../store/seen.js';
 import type { Account, NormalizedEmail } from '../types.js';
 
@@ -52,6 +53,18 @@ const IDLE_WATCHDOG_MS = 12 * 60_000;
 // consecutive connection failures and give up loudly once the bound is hit.
 const MAX_CONSECUTIVE_FAILURES = 20;
 
+/**
+ * How long stop() waits for an already-running sweep to finish before giving
+ * up on it.
+ *
+ * Bounded rather than unbounded because the tail of a sweep can be parked on
+ * a Telegram send (>=1.1s throttle per message, up to 5 attempts with 30s
+ * backoff), and /remove must stay responsive: a stuck send must not block
+ * removal indefinitely. Long enough that the ordinary case — a handful of
+ * remaining messages, or a single slow send — drains completely.
+ */
+export const SWEEP_DRAIN_TIMEOUT_MS = 5000;
+
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class AccountWatcher {
@@ -82,6 +95,18 @@ export class AccountWatcher {
 
   get label(): string {
     return this.#opts.account.label;
+  }
+
+  /**
+   * Formats a caught value for logging with this account's password removed.
+   * Every `console.error` in this class that interpolates an error goes
+   * through here: `registry.add(account)` is called with the plaintext
+   * password in `account.pass`, and a server that echoes a rejected LOGIN
+   * back would otherwise put it straight into the container log on every
+   * retry.
+   */
+  #logSafe(err: unknown): string {
+    return scrubSecret(errorMessage(err), this.#opts.account.pass);
   }
 
   async start(): Promise<void> {
@@ -115,6 +140,16 @@ export class AccountWatcher {
     this.#stopIdleWatchdog();
     this.#timer = null;
 
+    // Drain BEFORE tearing the clients down. Logging the IMAP client out
+    // cannot stop a sweep that is already past fetchSince: everything after
+    // it (onEmail, markSeen, setFolderState) is local work plus Telegram,
+    // with no IMAP call left to fail. Callers rely on stop() meaning "no
+    // more writes are coming from this watcher" — WatcherRegistry.remove()
+    // awaits stop(), and commands.ts purges the account's seen-state
+    // immediately afterwards. Without this wait, that purge raced the
+    // sweep's own setFolderState and the stale high-water mark came back.
+    await this.#drainSweep();
+
     const disconnect = this.#opts.deps?.disconnect;
     if (disconnect) {
       await disconnect();
@@ -125,6 +160,45 @@ export class AccountWatcher {
     this.#sweepClient = null;
     this.#idleClient = null;
     this.#state = 'stopped';
+  }
+
+  /**
+   * Waits for the current sweep chain to settle, bounded by
+   * SWEEP_DRAIN_TIMEOUT_MS. `#sweepChain` never rejects (triggerSweep stores
+   * the caught form), so this only ever resolves.
+   *
+   * Any sweep queued but not yet started returns immediately once
+   * `#stopped` is set, so in practice this waits for at most the one sweep
+   * that was already running. Reconnects cannot extend it either:
+   * `#connectWithRetry` loops on `while (!this.#stopped)` and so returns at
+   * once rather than sleeping through its backoff.
+   */
+  async #drainSweep(): Promise<void> {
+    let settled = false;
+    const drained = this.#sweepChain.then(() => {
+      settled = true;
+    });
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SWEEP_DRAIN_TIMEOUT_MS);
+      // unref'd so a drain that finishes early cannot hold the event loop
+      // open for the remainder of the window during shutdown; cleared below
+      // for the same reason.
+      timer.unref?.();
+    });
+
+    try {
+      await Promise.race([drained, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+
+    if (!settled) {
+      console.error(
+        `[${this.#opts.account.label}] in-flight sweep did not finish within ${SWEEP_DRAIN_TIMEOUT_MS}ms of stop(); abandoning it, so a few of its remaining writes may still land`
+      );
+    }
   }
 
   /**
@@ -155,7 +229,7 @@ export class AccountWatcher {
 
         this.#consecutiveFailures += 1;
         console.error(
-          `[${this.#opts.account.label}] connection failed: ${errorMessage(err)}; retrying`
+          `[${this.#opts.account.label}] connection failed: ${this.#logSafe(err)}; retrying`
         );
 
         if (this.#consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -224,7 +298,7 @@ export class AccountWatcher {
     // needs this listener just as much as the idle client does. Never logs
     // more than the account label and error message.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] sweep client error: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] sweep client error: ${this.#logSafe(err)}`);
     });
     if (this.#stopped) {
       // stop() ran while client.connect() was in flight. stop() has already
@@ -266,7 +340,7 @@ export class AccountWatcher {
     // window between connect() and this listener unprotected would still
     // let a drop in exactly that window crash the process.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] idler error: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] idler error: ${this.#logSafe(err)}`);
     });
     if (this.#stopped) {
       // Same race as #connectSweep: stop() ran while we were connecting.
@@ -378,20 +452,22 @@ export class AccountWatcher {
         if (result.failures.length > 0) {
           console.error(
             `[${this.#opts.account.label}] sweep completed with ${result.failures.length} folder failure(s): ${result.failures
-              .map((f) => `${f.folder}: ${f.message}`)
+              .map((f) => `${f.folder}: ${scrubSecret(f.message, this.#opts.account.pass)}`)
               .join('; ')}`
           );
         }
       }
-      // Gate on !#stopped: stop() does not await this sweep chain, so an
-      // in-flight sweep can still be running when stop() flips #state to
-      // 'stopped'. Without this guard a straggling write here would clobber
-      // that terminal state and a shut-down account would keep reporting
-      // as 'ok' or 'reconnecting'.
+      // Gate on !#stopped: stop() flips #stopped before it starts draining
+      // this chain, so the sweep it is waiting on runs its remaining lines
+      // (this one included) with #stopped already true. Without this guard a
+      // straggling write here would clobber the terminal 'stopped' state and
+      // a shut-down account would keep reporting as 'ok' or 'reconnecting'.
+      // The guard is also the last line of defense for a sweep that outran
+      // SWEEP_DRAIN_TIMEOUT_MS and was abandoned.
       if (!this.#stopped) this.#state = 'ok';
     } catch (err) {
       if (!this.#stopped) this.#state = 'reconnecting';
-      console.error(`[${this.#opts.account.label}] sweep failed: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] sweep failed: ${this.#logSafe(err)}`);
       // Only the sweep client is suspect here; #connectSweep leaves the
       // idle client (and its watchdog) completely alone.
       const reconnected = await this.#connectWithRetry(() => this.#connectSweep());

@@ -10,7 +10,7 @@ export type Account = {
 export type Config = {
   telegramBotToken: string;
   telegramChatId: string;
-  mailboxes: Account[];
+  masterKey: string;
   sweepIntervalSeconds: number;
   previewChars: number;
   dbPath: string;

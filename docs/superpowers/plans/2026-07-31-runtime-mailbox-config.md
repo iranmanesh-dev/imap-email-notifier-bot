@@ -1977,7 +1977,21 @@ Expected: PASS.
 
 - [ ] **Step 4: Add `deleteMessage` to `TelegramSender`**
 
-Append this method to the class in `src/telegram/sender.ts`:
+First introduce a base-URL field so both endpoints derive from one place. Deriving
+`/deleteMessage` by string-replacing `/sendMessage` in the existing URL would work but is
+fragile and reads as a hack. In `src/telegram/sender.ts`, replace the `#url` field and its
+assignment:
+
+```ts
+  readonly #baseUrl: string;
+```
+
+```ts
+    this.#baseUrl = `https://api.telegram.org/bot${opts.token}`;
+```
+
+Update the single existing use in `#post` from `this.#url` to
+`` `${this.#baseUrl}/sendMessage` ``. Then append this method to the class:
 
 ```ts
   /**
@@ -1987,7 +2001,7 @@ Append this method to the class in `src/telegram/sender.ts`:
    */
   async deleteMessage(chatId: string, messageId: number): Promise<boolean> {
     try {
-      const res = await this.#fetch(this.#url.replace('/sendMessage', '/deleteMessage'), {
+      const res = await this.#fetch(`${this.#baseUrl}/deleteMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
@@ -1998,6 +2012,10 @@ Append this method to the class in `src/telegram/sender.ts`:
     }
   }
 ```
+
+The existing sender test asserting the posted URL is
+`https://api.telegram.org/botT/sendMessage` must still pass unchanged — that is the
+regression check that this refactor did not alter the send path.
 
 - [ ] **Step 5: Add a test for `deleteMessage`**
 

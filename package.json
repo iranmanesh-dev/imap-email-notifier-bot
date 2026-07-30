@@ -28,8 +28,7 @@
   "dependencies": {
     "better-sqlite3": "^13.0.2",
     "imapflow": "^1.6.5",
-    "mailparser": "^3.9.14",
-    "zod": "^4.4.3"
+    "mailparser": "^3.9.14"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",

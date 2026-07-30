@@ -49,7 +49,27 @@ The full design rationale, including the failure modes each decision guards agai
 2. **Find your chat ID.** Send any message to your new bot, then open
    `https://api.telegram.org/bot<TOKEN>/getUpdates` and read
    `result[0].message.chat.id`.
-3. **Copy `.env.example` to `.env`** and fill in the token, chat ID, and mailboxes.
+3. **Create a `.env` file** next to `docker-compose.yml` with exactly these three
+   variables:
+
+   ```bash
+   TELEGRAM_BOT_TOKEN=<the token BotFather gave you>
+   TELEGRAM_CHAT_ID=<the chat id from step 2>
+   MASTER_KEY=<a fresh secret, at least 32 characters>
+   ```
+
+   Generate `MASTER_KEY` with `openssl rand -base64 32`. Every other variable in
+   [Configuration](#configuration) is optional and has a working default.
+
+   There is no `MAILBOXES` variable — mailboxes are added at runtime by messaging the
+   bot (see [Adding a mailbox](#adding-a-mailbox) below), and a fresh install
+   legitimately starts with zero mailboxes configured.
+
+   > **Note:** the `.env.example` file in this repository is out of date. It still lists a
+   > `MAILBOXES` variable, which has been removed and is ignored, and it does not mention
+   > `MASTER_KEY`, which is required. Use the three variables above rather than copying
+   > that file — copying it verbatim fails at boot with
+   > `fatal: Missing required environment variable MASTER_KEY`.
 
 ## Run locally
 
@@ -113,24 +133,35 @@ healthcheck UI step to configure in either mode below.
 this repo):
 
 1. New Resource → Docker Compose → point at this repository.
-2. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MAILBOXES` as environment
-   variables. Mark them as secrets.
+2. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MASTER_KEY` as environment
+   variables. Mark them as secrets. `MASTER_KEY` must be at least 32 characters
+   (`openssl rand -base64 32`) and is not recoverable — see
+   [Adding a mailbox](#adding-a-mailbox).
 3. Deploy. The `/data` volume is already declared in `docker-compose.yml`
    (`notifier-data:/data`) — no extra volume configuration needed in the UI.
 
 **Option B — Dockerfile only** (no compose file):
 
 1. New Resource → Dockerfile → point at this repository.
-2. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MAILBOXES` as environment
-   variables. Mark them as secrets.
+2. Add `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, and `MASTER_KEY` as environment
+   variables. Mark them as secrets. `MASTER_KEY` must be at least 32 characters
+   (`openssl rand -base64 32`) and is not recoverable — see
+   [Adding a mailbox](#adding-a-mailbox).
 3. Add a persistent volume mounted at `/data` yourself — this mode has no
    compose file to declare it, so skipping this step means the dedup database
    does not survive a redeploy.
-4. Deploy.
+4. Set the stop grace period to **20 seconds** if the platform exposes it. This
+   mode has no compose file, so it does not inherit the `stop_grace_period`
+   declared in `docker-compose.yml`, and Docker's 10s default can SIGKILL a
+   clean shutdown midway — see [Shutdown](#shutdown) below.
+5. Deploy.
 
 **What "healthy" means here:** the container's healthcheck reports pure
 liveness — did `/healthz` respond at all — not whether every mailbox is
-currently connected. A single degraded or reconnecting mailbox does **not**
+currently connected. **A freshly deployed container with zero mailboxes added
+is expected and reports healthy**; add mailboxes afterwards by messaging the
+bot (see [Adding a mailbox](#adding-a-mailbox)). A single degraded or
+reconnecting mailbox does **not**
 turn the container unhealthy and does **not** trigger a restart (see the
 `HEALTHCHECK` comment in the Dockerfile for why a restart would make things
 worse, not better, for every degraded state this app can be in). If you want
@@ -155,19 +186,55 @@ to know when a mailbox is actually degraded, use one of:
   than treated as fatal — the process keeps running and `/healthz` reports
   503 for that account until it reconnects or exhausts the retry budget.
 
+### Shutdown
+
+On `SIGTERM` the app stops every watcher, closes the health server and closes both
+SQLite databases before exiting, so the write-ahead log is checkpointed cleanly.
+
+An ordinary shutdown finishes in well under a second, but the worst case is bounded
+rather than instant: up to 5s waiting for the Telegram receiver to notice the abort,
+plus up to 5s draining an in-flight mailbox sweep (so it cannot write notification
+state back after a removal has purged it), plus the IMAP logouts — roughly 11–12
+seconds.
+
+That exceeds Docker's default 10s grace period, after which the container is SIGKILLed
+and the databases never close cleanly. `docker-compose.yml` therefore sets
+`stop_grace_period: 20s`. If you run the image without that compose file, set an
+equivalent stop timeout yourself.
+
 ## Configuration
 
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | yes | — | Bot token from BotFather |
-| `TELEGRAM_CHAT_ID` | yes | — | Chat to send notifications to |
-| `MAILBOXES` | yes | — | JSON array of `{label, host, port, user, pass, secure?}` |
+| `TELEGRAM_CHAT_ID` | yes | — | The only chat allowed to send commands |
+| `MASTER_KEY` | yes | — | ≥32 chars; encrypts stored mailbox passwords. `openssl rand -base64 32` |
 | `SWEEP_INTERVAL_SECONDS` | no | `60` | Non-INBOX folder check interval |
 | `PREVIEW_CHARS` | no | `200` | Body preview length |
-| `DB_PATH` | no | `/data/seen.db` | SQLite location (WAL mode) |
-| `HEALTH_PORT` | no | `8080` | Health server port (the image's `HEALTHCHECK` reads this same variable, so overriding it cannot desync the healthcheck from the actual port) |
+| `DB_PATH` | no | `/data/seen.db` | SQLite location |
+| `HEALTH_PORT` | no | `8080` | Health server port |
 
-Invalid configuration (missing required variable, malformed `MAILBOXES` JSON, or
-a `MAILBOXES` entry failing validation) makes the process print
-`fatal: ...` to stderr and exit 1 immediately at boot — it never starts with a
-partially-valid configuration.
+Invalid configuration (a missing required variable, or a `MASTER_KEY` shorter than 32
+characters) makes the process print `fatal: ...` to stderr and exit 1 immediately at
+boot — it never starts with a partially-valid configuration.
+
+### Adding a mailbox
+
+Mailboxes are configured at runtime by messaging the bot — there is no `MAILBOXES`
+variable, and a fresh install legitimately starts with zero mailboxes configured. Send:
+
+```
+/add Work imap.hostinger.com 993 me@mydomain.com
+```
+
+The bot asks for the password as a separate message and deletes it as soon as it has
+read it, then tests the credentials before saving. Other commands: `/list`,
+`/remove <label>`, `/status`, `/test <label>`.
+
+**`MASTER_KEY` is not recoverable.** It encrypts every stored mailbox password. If you
+lose it or change it, stored passwords can no longer be decrypted and you must re-add
+each mailbox from scratch. Keep a copy wherever you keep your other credentials.
+
+Note that `/data` now holds those encrypted mailbox credentials as well as the dedup
+database, so treat volume backups, snapshots and volume clones as credential material —
+store them with the same care as `MASTER_KEY` itself, and keep the two apart.

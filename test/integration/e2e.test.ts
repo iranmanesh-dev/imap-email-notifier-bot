@@ -22,7 +22,9 @@ import type { NormalizedEmail } from '../../src/types.js';
 
 const IMAP_HOST = '127.0.0.1';
 const IMAP_PORT = 3143;
-const IMAP = { host: IMAP_HOST, port: IMAP_PORT, secure: false, auth: { user: 'tester', pass: 'testpass' } };
+const IMAP_USER = 'tester';
+const IMAP_PASS = 'testpass';
+const IMAP = { host: IMAP_HOST, port: IMAP_PORT, secure: false, auth: { user: IMAP_USER, pass: IMAP_PASS } };
 const SMTP = { host: '127.0.0.1', port: 3025, secure: false };
 const START_COMMAND = 'docker compose -f test/integration/docker-compose.test.yml up -d';
 
@@ -379,4 +381,142 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(failDeliveries).toHaveLength(1);
     expect(okDeliveries).toHaveLength(1);
   });
+
+  // Success criteria 1 and 2, end to end with a REAL AccountWatcher against
+  // GreenMail. A previous version of this test substituted a fake watcher
+  // factory that never touched IMAP and asserted only that arrays had been
+  // pushed to — bookkeeping already covered by registry.test.ts — so the two
+  // headline criteria had no end-to-end evidence at all, and the exact seam
+  // where a straggling sweep can write state back after a purge was never
+  // exercised.
+  //
+  // Proving "no notification arrives after /remove" needs a synchronisation
+  // signal rather than a fixed sleep. A second watcher ('Witness') on the
+  // same GreenMail mailbox provides one: it stays running across the
+  // removal, so the moment IT reports the post-removal message, at least one
+  // full sweep cycle has demonstrably elapsed since that message landed —
+  // and the removed watcher must still have nothing.
+  it('delivers a real message through a real watcher after add, and stops delivering after remove', async () => {
+    const { MailboxStore } = await import('../../src/store/mailboxes.js');
+    const { deriveKey } = await import('../../src/crypto/secret.js');
+    const { WatcherRegistry } = await import('../../src/imap/registry.js');
+    const { AccountWatcher } = await import('../../src/imap/watcher.js');
+
+    const mb = new MailboxStore(join(dir, 'mailboxes.db'), deriveKey('k'.repeat(32)));
+    mb.add({
+      label: 'Live', host: IMAP_HOST, port: IMAP_PORT,
+      user: IMAP_USER, pass: IMAP_PASS, secure: false,
+    });
+
+    // The store round-trip is still asserted (the password really is
+    // encrypted at rest and decrypts back), but note MailboxStore.get()
+    // hardcodes secure: true, and the GreenMail container only exposes
+    // plaintext IMAP on 3143 — so the account handed to the watcher
+    // overrides just that field.
+    const stored = mb.get('Live');
+    expect(stored?.pass).toBe(IMAP_PASS);
+    const liveAccount = { ...stored!, secure: false };
+    const witnessAccount = { ...liveAccount, label: 'Witness' };
+
+    const received: Record<string, NormalizedEmail[]> = { Live: [], Witness: [] };
+    const fatals: string[] = [];
+    const registry = new WatcherRegistry(
+      (a) =>
+        new AccountWatcher({
+          account: a,
+          store,
+          previewChars: 200,
+          // Short so the test polls a real sweep cycle instead of sleeping.
+          sweepIntervalSeconds: 1,
+          onEmail: async (email) => {
+            received[email.accountLabel]!.push(email);
+          },
+          onFatal: async (_account, message) => {
+            fatals.push(message);
+          },
+        })
+    );
+
+    /** Polls a predicate instead of sleeping a fixed duration. */
+    async function waitUntil(what: string, done: () => boolean, timeoutMs = 25_000): Promise<void> {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (done()) return;
+        await new Promise((r) => setTimeout(r, 100));
+      }
+      const detail = fatals.length > 0 ? ` Watcher reported: ${fatals.join('; ')}` : '';
+      throw new Error(`timed out waiting for ${what}.${detail}`);
+    }
+
+    try {
+      await registry.add(liveAccount);
+      await registry.add(witnessAccount);
+      expect(registry.has('Live')).toBe(true);
+
+      // start() runs a baseline sweep, so pre-existing mail (including
+      // whatever earlier tests in this file left behind) notifies nothing.
+      expect(received.Live).toHaveLength(0);
+
+      // --- Criterion 1: a message sent after the add is really delivered.
+      const addedId = uniqueId('watcher-delivers');
+      const beforeAdded = await currentCount('INBOX');
+      await sendMail('Delivered by a real watcher', addedId);
+      await waitForCount('INBOX', beforeAdded + 1);
+
+      await waitUntil('the live watcher to deliver the new message', () =>
+        received.Live!.some((e) => e.messageId === addedId)
+      );
+      await waitUntil('the witness watcher to deliver the new message', () =>
+        received.Witness!.some((e) => e.messageId === addedId)
+      );
+
+      const delivered = received.Live!.filter((e) => e.messageId === addedId);
+      expect(delivered).toHaveLength(1);
+      expect(delivered[0]!.subject).toBe('Delivered by a real watcher');
+      expect(delivered[0]!.folder).toBe('INBOX');
+      // A real sweep really persisted this account's state.
+      expect(store.getFolderState('Live', 'INBOX')).not.toBeNull();
+      expect(store.hasSeen('Live', addedId)).toBe(true);
+
+      // --- Criterion 2: removal stops delivery and purges the state.
+      // Exactly the order completeRemove uses.
+      expect(await registry.remove('Live')).toBe(true);
+      expect(mb.remove('Live')).toBe(true);
+      const purged = store.purgeAccount('Live');
+      expect(purged).toBeGreaterThan(0); // a no-op purge could not satisfy this
+      expect(registry.has('Live')).toBe(false);
+      expect(mb.get('Live')).toBeNull();
+
+      const deliveredCountAtRemoval = received.Live!.length;
+
+      const afterId = uniqueId('after-removal');
+      const beforeAfter = await currentCount('INBOX');
+      await sendMail('Sent after the mailbox was removed', afterId);
+      await waitForCount('INBOX', beforeAfter + 1);
+
+      // The witness receiving it proves a full sweep cycle has elapsed since
+      // this message landed — so "Live did not receive it" is a real
+      // observation, not just an impatient assertion.
+      await waitUntil('the witness watcher to deliver the post-removal message', () =>
+        received.Witness!.some((e) => e.messageId === afterId)
+      );
+
+      expect(received.Live!.some((e) => e.messageId === afterId)).toBe(false);
+      expect(received.Live!).toHaveLength(deliveredCountAtRemoval);
+
+      // The purge stuck: nothing the stopped watcher was still doing wrote
+      // its high-water mark back. This is the finding-2 seam — stop() drains
+      // the in-flight sweep, so a straggling setFolderState cannot land after
+      // purgeAccount and defeat the re-baseline on a future re-add.
+      expect(store.getFolderState('Live', 'INBOX')).toBeNull();
+      expect(store.hasSeen('Live', addedId)).toBe(false);
+
+      // Cross-account isolation: purging 'Live' left the other account alone.
+      expect(store.getFolderState('Witness', 'INBOX')).not.toBeNull();
+      expect(store.hasSeen('Witness', addedId)).toBe(true);
+    } finally {
+      await registry.stopAll();
+      mb.close();
+    }
+  }, 60_000);
 });
