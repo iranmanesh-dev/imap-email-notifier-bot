@@ -234,13 +234,45 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
   return deps.reply(`Removed "${label}" and stopped watching it.`);
 }
 
+/**
+ * Reconciles the two sources of truth rather than reporting only one.
+ *
+ * /list reads the store; the registry holds the live watchers. A mailbox
+ * can be in the store with no watcher — skipped during the startup restore,
+ * or persisted by /add whose registry.add then failed. Reporting only the
+ * registry made such a mailbox invisible here while /list showed it as
+ * perfectly normal, even though /status is the operator's only view into
+ * connection health.
+ */
 async function showStatus(deps: CommandDeps): Promise<void> {
   const states = deps.registry.states();
-  if (states.length === 0) {
+  const watched = new Set(states.map((s) => s.label));
+
+  let unwatched: string[] = [];
+  try {
+    unwatched = deps.mailboxes.labels().filter((label) => !watched.has(label));
+  } catch (err) {
+    // labels() does not decrypt, so this is a genuine storage failure. Say
+    // so rather than silently under-reporting.
+    await deps.reply(`Warning: could not read the saved mailbox list: ${errorText(err)}`);
+  }
+
+  if (states.length === 0 && unwatched.length === 0) {
     return deps.reply('No mailboxes are being watched. Add one with /add.');
   }
-  const lines = states.map((s) => `• ${s.label} — ${s.state}`);
-  return deps.reply(`Watcher status:\n${lines.join('\n')}`);
+
+  const lines = [
+    ...states.map((s) => `• ${s.label} — ${s.state}`),
+    ...unwatched.map((label) => `• ${label} — NOT BEING WATCHED (saved, but no watcher running)`),
+  ];
+
+  const hint =
+    unwatched.length > 0
+      ? `\n\nA saved mailbox with no watcher is not delivering anything. ` +
+        `Try /test <label> to see why, then restart the bot or /remove and /add it again.`
+      : '';
+
+  return deps.reply(`Watcher status:\n${lines.join('\n')}${hint}`);
 }
 
 async function testMailbox(args: string[], deps: CommandDeps): Promise<void> {

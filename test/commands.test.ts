@@ -366,6 +366,36 @@ describe('/status and /test', () => {
     expect(replies[0]).toContain('ok');
   });
 
+  // /list reads only the store; /status read only the registry, and nothing
+  // reconciled them. A mailbox skipped during the startup restore, or one
+  // where /add persisted but the watcher failed to start, looked perfectly
+  // normal in /list and never appeared in /status at all — while the spec
+  // calls /status the operator's only view into connection health.
+
+  it('/status flags a saved mailbox that has no watcher running', async () => {
+    const { deps, replies } = makeDeps();
+    deps.mailboxes.add({ label: 'Ghosted', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleUpdate(msg('/status'), deps);
+
+    expect(replies[0]).toContain('Work');
+    expect(replies[0]).toContain('ok');
+    expect(replies[0]).toContain('Ghosted');
+    expect(replies[0]).toMatch(/not being watched/i);
+  });
+
+  it('/status does not claim nothing is configured when every saved mailbox is unwatched', async () => {
+    const { deps, replies } = makeDeps();
+    deps.mailboxes.add({ label: 'Ghosted', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleUpdate(msg('/status'), deps);
+
+    expect(replies[0]).toContain('Ghosted');
+    expect(replies[0]).toMatch(/not being watched/i);
+    expect(replies[0]).not.toMatch(/^No mailboxes are being watched/);
+  });
+
   it('/test reports success for a saved mailbox', async () => {
     const { deps, replies } = makeDeps();
     deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
