@@ -372,19 +372,29 @@ export async function restoreMailboxes(deps: RestoreDeps): Promise<void> {
   );
 }
 
+/** The health server once it is actually bound and answering. */
+export type BoundHealthServer = { port: number; close(): Promise<void> };
+
 export type DaemonDeps = {
   healthPort: number;
   states: () => { label: string; state: WatcherState }[];
   /** Starts the Telegram long-poll loop. Returns the promise for its lifetime. */
   startReceiver: () => Promise<void>;
-  /** Restores persisted mailboxes. Started, deliberately never awaited. */
-  restore: () => Promise<void>;
+  /**
+   * Restores persisted mailboxes. Started, deliberately never awaited.
+   *
+   * Receives the health server, which by then is already listening. That
+   * argument exists to put the ordering invariant in the type: a restore
+   * cannot be started before the health port is bound, because it is handed
+   * the bound server. Production ignores it.
+   */
+  restore: (health: BoundHealthServer) => Promise<void>;
   armPrune: () => NodeJS.Timeout;
   logger?: EmailHandlerLogger;
 };
 
 export type StartedDaemon = {
-  health: { port: number; close(): Promise<void> };
+  health: BoundHealthServer;
   pruneTimer: NodeJS.Timeout;
   receiverDone: Promise<void>;
   /** Never rejects. Exposed for tests; boot itself must not await it. */
@@ -434,7 +444,7 @@ export async function startDaemon(deps: DaemonDeps): Promise<StartedDaemon> {
   const pruneTimer = deps.armPrune();
 
   // Deliberately NOT awaited: see the contract above.
-  const restoreDone = deps.restore().catch((err: unknown) => {
+  const restoreDone = deps.restore(health).catch((err: unknown) => {
     safeLogger.error(`mailbox restore failed unexpectedly: ${errorMessage(err)}`);
   });
 

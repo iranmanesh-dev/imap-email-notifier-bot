@@ -1,6 +1,4 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createServer } from 'node:http';
-import type { AddressInfo } from 'node:net';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
 import {
   createEmailHandler,
@@ -622,15 +620,6 @@ describe('restoreMailboxes', () => {
   });
 });
 
-/** Reserves a port by binding and immediately releasing it. */
-async function freePort(): Promise<number> {
-  const probe = createServer();
-  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
-  const port = (probe.address() as AddressInfo).port;
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  return port;
-}
-
 describe('startDaemon', () => {
   // CRITICAL regression (final review, finding 1): the restore loop ran
   // BEFORE startHealthServer and BEFORE the Telegram receiver, and awaited
@@ -646,9 +635,13 @@ describe('startDaemon', () => {
   // /remove the bad one because the receiver never started.
 
   it('binds the health server and starts the receiver before any watcher start() is awaited', async () => {
-    const port = await freePort();
     const order: string[] = [];
     let healthStatusWhenWatcherStarted: number | null = null;
+    // Port 0 (kernel-assigned, read back from the bound server) rather than a
+    // port picked in advance: pre-picking one races the other test workers,
+    // and a bind failure inside startDaemon would take the worker down with
+    // startHealthServer's default process.exit.
+    let healthPort = 0;
 
     // A real WatcherRegistry and the real restoreMailboxes, so the assertion
     // covers the actual production seam rather than a stand-in for it. Only
@@ -659,7 +652,7 @@ describe('startDaemon', () => {
       state: 'starting' as const,
       async start() {
         order.push('watcher-start');
-        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+        const res = await fetch(`http://127.0.0.1:${healthPort}/healthz`);
         healthStatusWhenWatcherStarted = res.status;
         await new Promise<void>(() => {}); // never resolves, like a 58-minute retry loop
       },
@@ -667,20 +660,24 @@ describe('startDaemon', () => {
     }));
 
     const daemon = await startDaemon({
-      healthPort: port,
+      healthPort: 0,
       states: () => registry.states(),
       startReceiver: () => {
         order.push('receiver');
         return new Promise<void>(() => {}); // a long-poll loop never settles either
       },
-      restore: () =>
-        restoreMailboxes({
+      // `health` is handed in already bound — that is the invariant under
+      // test, and reading its port here is what makes the probe below exact.
+      restore: (health) => {
+        healthPort = health.port;
+        return restoreMailboxes({
           labels: () => ['Work'],
           get: (label) => testAccount(label),
           registry,
           alert: async () => {},
           logger: { log: vi.fn(), error: vi.fn() },
-        }),
+        });
+      },
       armPrune: () => setInterval(() => {}, 1_000_000),
     });
 
@@ -701,11 +698,10 @@ describe('startDaemon', () => {
   });
 
   it('arms the prune timer before the restore starts, so a hanging mailbox cannot postpone retention enforcement', async () => {
-    const port = await freePort();
     const order: string[] = [];
 
     const daemon = await startDaemon({
-      healthPort: port,
+      healthPort: 0,
       states: () => [],
       startReceiver: () => new Promise<void>(() => {}),
       restore: async () => {
@@ -725,11 +721,10 @@ describe('startDaemon', () => {
   });
 
   it('does not reject when the detached restore rejects outright', async () => {
-    const port = await freePort();
     const logger = { log: vi.fn(), error: vi.fn() };
 
     const daemon = await startDaemon({
-      healthPort: port,
+      healthPort: 0,
       states: () => [],
       startReceiver: () => Promise.resolve(),
       restore: () => Promise.reject(new Error('restore exploded')),
