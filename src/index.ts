@@ -5,6 +5,7 @@ import { TelegramSender } from './telegram/sender.js';
 import type { SendOutcome } from './telegram/sender.js';
 import { formatEmail, escapeHtml } from './mail/format.js';
 import { AccountWatcher } from './imap/watcher.js';
+import type { WatcherState } from './imap/watcher.js';
 import { buildHealthReport, startHealthServer } from './health.js';
 import { deriveKey } from './crypto/secret.js';
 import { MailboxStore } from './store/mailboxes.js';
@@ -292,43 +293,152 @@ export function armPruneTimer(store: PruneStore, days: number, intervalMs: numbe
   return setInterval(runPrune, intervalMs);
 }
 
-/** Minimal shape `startAllWatchers` needs from an AccountWatcher, so tests can pass a stub. */
-export type StartableWatcher = {
-  label: string;
-  start(): Promise<void>;
+/** Minimal shape `restoreMailboxes` needs from the WatcherRegistry. */
+export type RestorableRegistry = {
+  add(account: Account): Promise<void>;
+};
+
+export type RestoreDeps = {
+  labels: () => string[];
+  get: (label: string) => Account | null;
+  registry: RestorableRegistry;
+  /** Sends an operator-visible alert. Never allowed to break the restore. */
+  alert: (message: string) => Promise<void>;
+  logger?: EmailHandlerLogger;
 };
 
 /**
- * Starts every watcher concurrently and never rejects, no matter how many
- * (or how badly) individual starts fail. Extracted from main() (mirroring
- * the createEmailHandler/shutdown extractions) after a review finding: the
- * previous inline version logged a failed start via a raw `console.error`
- * inside a `Promise.allSettled` forEach. Had that raw call thrown (EPIPE on
- * closed stdout is the standing example in this codebase), the throw would
- * have propagated synchronously out of the forEach and out of main() itself
- * — hitting the bottom-level `.catch` -> `process.exit(1)` and killing every
- * already-started healthy watcher, before the SIGTERM/SIGINT handlers were
- * even registered. That would have defeated the entire point of using
- * `allSettled` here in the first place.
+ * Restores every persisted mailbox CONCURRENTLY and never rejects, no matter
+ * how many (or how badly) individual mailboxes fail. Adapted from the former
+ * `startAllWatchers`, which this replaces outright rather than sitting
+ * alongside as a second variant.
  *
- * `Promise.allSettled` alone already guarantees every watcher's `start()` is
- * invoked and awaited regardless of any other watcher's outcome; routing the
- * failure log through the safe logger closes the remaining gap, so nothing
- * in this function can throw synchronously and stop main() from reaching
- * its next statement.
+ * Two separate hazards are covered here, and both have bitten this file
+ * before:
+ *
+ * 1. Concurrency. `registry.add()` awaits `AccountWatcher.start()`, which
+ *    awaits `#connectWithRetry` — up to `MAX_CONSECUTIVE_FAILURES` attempts
+ *    with backoff capped at 300s, i.e. roughly 58 minutes for a single bad
+ *    mailbox, plus ImapFlow's ~90s connect timeout per attempt. Restoring
+ *    mailboxes one-at-a-time meant one mailbox with a rotated password (the
+ *    bare `NO Login failed` case `isAuthError` provably cannot detect — see
+ *    watcher.ts) delayed every OTHER mailbox behind it for an hour.
+ *    `Promise.allSettled` over the whole set makes each mailbox's fate its
+ *    own.
+ *
+ * 2. Logging. The failure log goes through the safe logger, because a raw
+ *    `console.error` throwing (EPIPE on a closed stdout is the standing
+ *    example in this codebase) would propagate synchronously out of the
+ *    surrounding loop and out of the caller.
+ *
+ * The caller is expected NOT to await this — see `startDaemon`.
  */
-export async function startAllWatchers(
-  watchers: StartableWatcher[],
-  logger: EmailHandlerLogger = consoleLogger
-): Promise<void> {
-  const safeLogger = toSafeLogger(logger);
-  const startResults = await Promise.allSettled(watchers.map((w) => w.start()));
-  startResults.forEach((result, i) => {
-    if (result.status === 'rejected') {
-      const label = watchers[i]?.label ?? `#${i}`;
-      safeLogger.error(`[${label}] failed to start: ${errorMessage(result.reason)}`);
-    }
+export async function restoreMailboxes(deps: RestoreDeps): Promise<void> {
+  const safeLogger = toSafeLogger(deps.logger ?? consoleLogger);
+
+  let labels: string[];
+  try {
+    labels = deps.labels();
+  } catch (err) {
+    safeLogger.error(`could not list saved mailboxes to restore: ${errorMessage(err)}`);
+    return;
+  }
+
+  await Promise.allSettled(
+    labels.map(async (label) => {
+      try {
+        // `get()` decrypts, so it throws on a wrong/rotated MASTER_KEY or a
+        // tampered row. A mailbox that cannot be decrypted is skipped LOUDLY
+        // rather than silently dropped — silence is indistinguishable from
+        // "mail stopped arriving".
+        const account = deps.get(label);
+        if (account === null) return;
+        await deps.registry.add(account);
+      } catch (err) {
+        const detail = errorMessage(err);
+        safeLogger.error(`[${label}] could not be restored: ${detail}`);
+        await deps
+          .alert(
+            `⚠️ Mailbox "${escapeHtml(label)}" could not be restored: ${escapeHtml(detail)}. ` +
+              `If MASTER_KEY changed, remove and re-add it.`
+          )
+          .catch((alertErr: unknown) => {
+            safeLogger.error(
+              `[${label}] could not send the restore-failure alert: ${errorMessage(alertErr)}`
+            );
+          });
+      }
+    })
+  );
+}
+
+export type DaemonDeps = {
+  healthPort: number;
+  states: () => { label: string; state: WatcherState }[];
+  /** Starts the Telegram long-poll loop. Returns the promise for its lifetime. */
+  startReceiver: () => Promise<void>;
+  /** Restores persisted mailboxes. Started, deliberately never awaited. */
+  restore: () => Promise<void>;
+  armPrune: () => NodeJS.Timeout;
+  logger?: EmailHandlerLogger;
+};
+
+export type StartedDaemon = {
+  health: { port: number; close(): Promise<void> };
+  pruneTimer: NodeJS.Timeout;
+  receiverDone: Promise<void>;
+  /** Never rejects. Exposed for tests; boot itself must not await it. */
+  restoreDone: Promise<void>;
+};
+
+/**
+ * Brings the daemon up in the ONLY order that is safe, and returns promptly.
+ *
+ * The ordering here is load-bearing, not stylistic. A previous arrangement
+ * ran the mailbox restore first and awaited it, which meant one unreachable
+ * mailbox held the health port unbound for the better part of an hour. With
+ * the container healthcheck at `--start-period=45s --interval=30s
+ * --retries=3`, the orchestrator declared the container unhealthy at ~2m15s
+ * and restarted it — into the same stall, forever. Every healthy mailbox
+ * stopped delivering, and the operator could not `/remove` the broken one
+ * because the receiver had not started either.
+ *
+ * So:
+ *   1. The Telegram receiver starts first. The operator can always reach the
+ *      bot, even when every mailbox is down — that is the only way out of a
+ *      bad-credentials situation.
+ *   2. The health server binds next, and this awaits the actual `listening`
+ *      event rather than assuming `listen()` took effect synchronously.
+ *   3. The prune timer is armed, so retention is enforced regardless of what
+ *      the mailboxes are doing.
+ *   4. Only then is the restore kicked off — detached. `registry.add`
+ *      resolving is not required for correctness: `#connectWithRetry`
+ *      returns `false` instead of throwing on its terminal paths, and each
+ *      watcher self-heals through its own timers afterwards.
+ */
+export async function startDaemon(deps: DaemonDeps): Promise<StartedDaemon> {
+  const safeLogger = toSafeLogger(deps.logger ?? consoleLogger);
+
+  const receiverDone = deps.startReceiver();
+
+  const health = startHealthServer(deps.healthPort, () => buildHealthReport(deps.states()));
+  try {
+    await health.ready;
+  } catch (err) {
+    // startHealthServer's own 'error' handler has already logged this and
+    // called exit(1). Swallow it here so the failure path is that exit, not
+    // an exception thrown out of boot before it can happen.
+    safeLogger.error(`health server did not bind: ${errorMessage(err)}`);
+  }
+
+  const pruneTimer = deps.armPrune();
+
+  // Deliberately NOT awaited: see the contract above.
+  const restoreDone = deps.restore().catch((err: unknown) => {
+    safeLogger.error(`mailbox restore failed unexpectedly: ${errorMessage(err)}`);
   });
+
+  return { health, pruneTimer, receiverDone, restoreDone };
 }
 
 async function main(): Promise<void> {
@@ -363,23 +473,6 @@ async function main(): Promise<void> {
     })
   );
 
-  // Restore whatever was configured before the last restart. A mailbox
-  // whose password cannot be decrypted is skipped loudly rather than
-  // silently dropped — silence is indistinguishable from "mail stopped".
-  for (const label of mailboxes.labels()) {
-    try {
-      const account = mailboxes.get(label);
-      if (account !== null) await registry.add(account);
-    } catch (err) {
-      const detail = errorMessage(err);
-      safeConsoleLogger.error(`[${label}] could not be restored: ${detail}`);
-      await sender.send(
-        `⚠️ Mailbox "${escapeHtml(label)}" could not be restored: ${escapeHtml(detail)}. ` +
-          `If MASTER_KEY changed, remove and re-add it.`
-      );
-    }
-  }
-
   // Trimmed once here and reused for both the operator-chat-id comparison in
   // handleUpdate and the deleteMessage call: trailing whitespace in the env
   // var would make every `String(chat.id) !== operatorChatId` comparison
@@ -388,53 +481,33 @@ async function main(): Promise<void> {
   const conversations = new Conversations();
   const receiverAbort = new AbortController();
 
-  const receiverDone = runReceiver({
-    token: config.telegramBotToken,
-    signal: receiverAbort.signal,
-    onUpdate: (update) =>
-      handleUpdate(update, {
-        operatorChatId,
-        mailboxes,
-        seen: store,
-        registry,
-        conversations,
-        probe: probeMailbox,
-        reply: async (text) => {
-          // commands.ts deliberately emits no markup, but TelegramSender
-          // always sends with parse_mode: 'HTML' — a label or hostname
-          // containing '<' or '&' would otherwise produce a Telegram 400.
-          await sender.send(escapeHtml(text));
-        },
-        deleteMessage: (messageId) => sender.deleteMessage(operatorChatId, messageId),
-        now: () => Date.now(),
-      }),
-  }).catch((err: unknown) => {
-    if (err instanceof FatalTelegramError) {
-      safeConsoleLogger.error(`fatal: ${err.message}`);
-      process.exit(1);
-    }
-    safeConsoleLogger.error(`receiver stopped: ${errorMessage(err)}`);
-  });
-
-  const health = startHealthServer(config.healthPort, () => buildHealthReport(registry.states()));
-
-  const pruneTimer = armPruneTimer(store, PRUNE_AFTER_DAYS, PRUNE_INTERVAL_MS);
-
-  safeConsoleLogger.log(`watching ${registry.size()} mailbox(es); health on :${config.healthPort}`);
-
+  let started: StartedDaemon | null = null;
   let shuttingDown = false;
-  const onSignal = (signal: string): void => {
+
+  /**
+   * The single entry point into shutdown. Takes the intended exit code so
+   * callers other than SIGTERM/SIGINT can request a non-zero exit without
+   * bypassing the clean-shutdown sequence.
+   */
+  const beginShutdown = (reason: string, code: number): void => {
     if (shuttingDown) return;
     shuttingDown = true;
-    void shutdown(signal, {
+    const daemon = started;
+    if (daemon === null) {
+      // Fatal before startDaemon returned: there is nothing constructed yet
+      // to unwind, so there is nothing a shutdown() call could clean up.
+      process.exit(code);
+      return;
+    }
+    void shutdown(reason, {
       watchers: registry
         .states()
         .map((s) => ({ label: s.label, stop: () => registry.remove(s.label).then(() => undefined) })),
-      pruneTimer,
-      health,
+      pruneTimer: daemon.pruneTimer,
+      health: daemon.health,
       store,
       mailboxStore: mailboxes,
-      exit: (code) => process.exit(code),
+      exit: (c) => process.exit(c),
       onBeforeExit: async () => {
         receiverAbort.abort();
         // Bounded: receiverDone may not settle promptly (an in-flight
@@ -445,13 +518,62 @@ async function main(): Promise<void> {
         // an in-flight command that resumes after this bounded wait still
         // has the longest practical window to finish before the database
         // goes away.
-        await withShutdownTimeout(receiverDone, RECEIVER_SHUTDOWN_TIMEOUT_MS, safeConsoleLogger);
+        await withShutdownTimeout(daemon.receiverDone, RECEIVER_SHUTDOWN_TIMEOUT_MS, safeConsoleLogger);
       },
     });
   };
 
-  process.on('SIGTERM', () => onSignal('SIGTERM'));
-  process.on('SIGINT', () => onSignal('SIGINT'));
+  started = await startDaemon({
+    healthPort: config.healthPort,
+    states: () => registry.states(),
+    startReceiver: () =>
+      runReceiver({
+        token: config.telegramBotToken,
+        signal: receiverAbort.signal,
+        onUpdate: (update) =>
+          handleUpdate(update, {
+            operatorChatId,
+            mailboxes,
+            seen: store,
+            registry,
+            conversations,
+            probe: probeMailbox,
+            reply: async (text) => {
+              // commands.ts deliberately emits no markup, but TelegramSender
+              // always sends with parse_mode: 'HTML' — a label or hostname
+              // containing '<' or '&' would otherwise produce a Telegram 400.
+              await sender.send(escapeHtml(text));
+            },
+            deleteMessage: (messageId) => sender.deleteMessage(operatorChatId, messageId),
+            now: () => Date.now(),
+          }),
+      }).catch((err: unknown) => {
+        if (err instanceof FatalTelegramError) {
+          safeConsoleLogger.error(`fatal: ${err.message}`);
+          process.exit(1);
+        }
+        safeConsoleLogger.error(`receiver stopped: ${errorMessage(err)}`);
+      }),
+    // Detached inside startDaemon: a mailbox that cannot connect must not
+    // hold the health port, the receiver, or the signal handlers hostage.
+    restore: () =>
+      restoreMailboxes({
+        labels: () => mailboxes.labels(),
+        get: (label) => mailboxes.get(label),
+        registry,
+        alert: async (message) => {
+          await sender.send(message);
+        },
+      }),
+    armPrune: () => armPruneTimer(store, PRUNE_AFTER_DAYS, PRUNE_INTERVAL_MS),
+  });
+
+  safeConsoleLogger.log(
+    `health on :${config.healthPort}; restoring saved mailboxes in the background`
+  );
+
+  process.on('SIGTERM', () => beginShutdown('SIGTERM', 0));
+  process.on('SIGINT', () => beginShutdown('SIGINT', 0));
 }
 
 // Guard direct execution vs. being imported (e.g. by tests that only want

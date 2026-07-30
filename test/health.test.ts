@@ -1,14 +1,18 @@
 import { describe, it, expect, vi } from 'vitest';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
 import {
   createEmailHandler,
   shutdown,
-  startAllWatchers,
+  restoreMailboxes,
+  startDaemon,
   armPruneTimer,
   withShutdownTimeout,
   ONBEFORE_EXIT_TIMEOUT_MS,
 } from '../src/index.js';
-import type { NormalizedEmail } from '../src/types.js';
+import { WatcherRegistry } from '../src/imap/registry.js';
+import type { NormalizedEmail, Account } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
 describe('buildHealthReport', () => {
@@ -515,24 +519,24 @@ describe('armPruneTimer', () => {
   });
 });
 
-describe('startAllWatchers', () => {
-  it('starts every watcher (including ones after a failing one) and never throws, even when the logger used to report a failed start itself throws (e.g. EPIPE)', async () => {
-    // This is the Finding-5 regression: main() previously logged a failed
-    // watcher start via a raw console.error inside a Promise.allSettled
-    // forEach. If that raw call threw (EPIPE on closed stdout), the throw
-    // propagated synchronously out of the forEach and out of main() itself,
-    // hitting the bottom-level `.catch` -> process.exit(1) and taking down
-    // every already-started healthy watcher — before SIGTERM/SIGINT
-    // handlers were even registered. Proving this function resolves
-    // (instead of throwing) when its logger explodes is what guarantees
-    // main()'s subsequent statements — including registering the signal
-    // handlers — are still reached, since main() is straight-line
-    // sequential code with nothing else that could stop it there.
-    const healthy = { label: 'Healthy', start: vi.fn(async (): Promise<void> => {}) };
-    const failing = {
-      label: 'Failing',
-      start: vi.fn(async (): Promise<void> => {
-        throw new Error('connect-failed');
+function testAccount(label: string): Account {
+  return { label, host: 'h', port: 993, user: 'u', pass: 'p', secure: true };
+}
+
+describe('restoreMailboxes', () => {
+  it('starts every mailbox (including ones after a failing one) and never throws, even when the logger used to report a failure itself throws (e.g. EPIPE)', async () => {
+    // This is the Finding-5 regression, inherited from startAllWatchers:
+    // main() previously logged a failed watcher start via a raw
+    // console.error inside a Promise.allSettled forEach. If that raw call
+    // threw (EPIPE on closed stdout), the throw propagated synchronously out
+    // of the forEach and out of main() itself, hitting the bottom-level
+    // `.catch` -> process.exit(1) and taking down every already-started
+    // healthy watcher — before SIGTERM/SIGINT handlers were even registered.
+    const started: string[] = [];
+    const registry = {
+      add: vi.fn(async (a: Account) => {
+        if (a.label === 'Failing') throw new Error('connect-failed');
+        started.push(a.label);
       }),
     };
     const throwingLogger = {
@@ -544,24 +548,201 @@ describe('startAllWatchers', () => {
       }),
     };
 
-    await expect(startAllWatchers([healthy, failing], throwingLogger)).resolves.toBeUndefined();
+    await expect(
+      restoreMailboxes({
+        labels: () => ['Failing', 'Healthy'],
+        get: (label) => testAccount(label),
+        registry,
+        alert: async () => {},
+        logger: throwingLogger,
+      })
+    ).resolves.toBeUndefined();
 
-    expect(healthy.start).toHaveBeenCalledTimes(1);
-    expect(failing.start).toHaveBeenCalledTimes(1);
-    // The attempt to log the failure happened (and was swallowed) rather
-    // than being skipped or crashing the function outright.
+    expect(registry.add).toHaveBeenCalledTimes(2);
+    // One failing mailbox does not stop the other from being started.
+    expect(started).toEqual(['Healthy']);
     expect(throwingLogger.error).toHaveBeenCalledTimes(1);
   });
 
-  it('logs nothing when every watcher starts successfully', async () => {
-    const a = { label: 'A', start: vi.fn(async (): Promise<void> => {}) };
-    const b = { label: 'B', start: vi.fn(async (): Promise<void> => {}) };
+  it('restores concurrently rather than serially, so one slow mailbox cannot delay the others', async () => {
+    // The regression this guards: the restore loop used to `await
+    // registry.add(...)` per mailbox in sequence, and registry.add awaits
+    // AccountWatcher.start() -> #connectWithRetry, which sleeps for up to
+    // ~58 minutes before giving up on a single bad mailbox.
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const started: string[] = [];
+    const registry = {
+      add: async (a: Account) => {
+        if (a.label === 'Slow') await blocked;
+        started.push(a.label);
+      },
+    };
+
+    const done = restoreMailboxes({
+      labels: () => ['Slow', 'Fast'],
+      get: (label) => testAccount(label),
+      registry,
+      alert: async () => {},
+      logger: { log: vi.fn(), error: vi.fn() },
+    });
+
+    await vi.waitFor(() => {
+      expect(started).toEqual(['Fast']);
+    });
+    release();
+    await done;
+    expect(started.sort()).toEqual(['Fast', 'Slow']);
+  });
+
+  it('logs loudly and sends a Telegram alert when a mailbox cannot be decrypted, without touching the others', async () => {
+    const alert = vi.fn(async () => {});
+    const logger = { log: vi.fn(), error: vi.fn() };
+    const started: string[] = [];
+
+    await restoreMailboxes({
+      labels: () => ['Broken', 'Fine'],
+      get: (label) => {
+        if (label === 'Broken') throw new Error('decrypt failed: bad key');
+        return testAccount(label);
+      },
+      registry: { add: async (a: Account) => { started.push(a.label); } },
+      alert,
+      logger,
+    });
+
+    expect(started).toEqual(['Fine']);
+    expect(logger.error.mock.calls[0]?.[0]).toContain('Broken');
+    expect(logger.error.mock.calls[0]?.[0]).toContain('decrypt failed');
+    expect(alert).toHaveBeenCalledTimes(1);
+    expect(alert.mock.calls[0]?.[0]).toContain('Broken');
+    expect(alert.mock.calls[0]?.[0]).toContain('MASTER_KEY');
+  });
+});
+
+/** Reserves a port by binding and immediately releasing it. */
+async function freePort(): Promise<number> {
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, '127.0.0.1', resolve));
+  const port = (probe.address() as AddressInfo).port;
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  return port;
+}
+
+describe('startDaemon', () => {
+  // CRITICAL regression (final review, finding 1): the restore loop ran
+  // BEFORE startHealthServer and BEFORE the Telegram receiver, and awaited
+  // registry.add(account) per mailbox in sequence. registry.add awaits
+  // AccountWatcher.start() -> #connectWithRetry, which retries up to 20
+  // times with backoff capped at 300s — roughly 58 minutes of sleeping for
+  // ONE bad mailbox, on top of ImapFlow's 90s per-attempt connect timeout.
+  // Everything after it was blocked: the receiver, the health server, the
+  // prune timer, and the SIGTERM handler. With the Dockerfile's
+  // --start-period=45s --interval=30s --retries=3, the health port was still
+  // unbound at ~2m15s, so the orchestrator restarted the container — forever.
+  // Every other mailbox stopped delivering, and the operator could not even
+  // /remove the bad one because the receiver never started.
+
+  it('binds the health server and starts the receiver before any watcher start() is awaited', async () => {
+    const port = await freePort();
+    const order: string[] = [];
+    let healthStatusWhenWatcherStarted: number | null = null;
+
+    // A real WatcherRegistry and the real restoreMailboxes, so the assertion
+    // covers the actual production seam rather than a stand-in for it. Only
+    // the watcher's IMAP work is faked — and it is faked as the failure mode
+    // that caused the outage: a start() that never resolves.
+    const registry = new WatcherRegistry((a) => ({
+      label: a.label,
+      state: 'starting' as const,
+      async start() {
+        order.push('watcher-start');
+        const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+        healthStatusWhenWatcherStarted = res.status;
+        await new Promise<void>(() => {}); // never resolves, like a 58-minute retry loop
+      },
+      async stop() {},
+    }));
+
+    const daemon = await startDaemon({
+      healthPort: port,
+      states: () => registry.states(),
+      startReceiver: () => {
+        order.push('receiver');
+        return new Promise<void>(() => {}); // a long-poll loop never settles either
+      },
+      restore: () =>
+        restoreMailboxes({
+          labels: () => ['Work'],
+          get: (label) => testAccount(label),
+          registry,
+          alert: async () => {},
+          logger: { log: vi.fn(), error: vi.fn() },
+        }),
+      armPrune: () => setInterval(() => {}, 1_000_000),
+    });
+
+    // startDaemon resolved at all: boot is no longer serialized behind a
+    // watcher that will never come up. Wait for the probe issued from inside
+    // start() to come back, not merely for start() to have been entered.
+    await vi.waitFor(() => {
+      expect(healthStatusWhenWatcherStarted).not.toBeNull();
+    });
+
+    expect(order).toEqual(['receiver', 'watcher-start']);
+    // The load-bearing assertion: at the moment the first watcher start()
+    // was entered, /healthz was already answering.
+    expect(healthStatusWhenWatcherStarted).toBe(200);
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
+  });
+
+  it('arms the prune timer before the restore starts, so a hanging mailbox cannot postpone retention enforcement', async () => {
+    const port = await freePort();
+    const order: string[] = [];
+
+    const daemon = await startDaemon({
+      healthPort: port,
+      states: () => [],
+      startReceiver: () => new Promise<void>(() => {}),
+      restore: async () => {
+        order.push('restore');
+        await new Promise<void>(() => {});
+      },
+      armPrune: () => {
+        order.push('prune');
+        return setInterval(() => {}, 1_000_000);
+      },
+    });
+
+    expect(order).toEqual(['prune', 'restore']);
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
+  });
+
+  it('does not reject when the detached restore rejects outright', async () => {
+    const port = await freePort();
     const logger = { log: vi.fn(), error: vi.fn() };
 
-    await startAllWatchers([a, b], logger);
+    const daemon = await startDaemon({
+      healthPort: port,
+      states: () => [],
+      startReceiver: () => Promise.resolve(),
+      restore: () => Promise.reject(new Error('restore exploded')),
+      armPrune: () => setInterval(() => {}, 1_000_000),
+      logger,
+    });
 
-    expect(a.start).toHaveBeenCalledTimes(1);
-    expect(b.start).toHaveBeenCalledTimes(1);
-    expect(logger.error).not.toHaveBeenCalled();
+    await expect(daemon.restoreDone).resolves.toBeUndefined();
+    expect(logger.error.mock.calls.some((c) => String(c[0]).includes('restore exploded'))).toBe(
+      true
+    );
+
+    clearInterval(daemon.pruneTimer);
+    await daemon.health.close();
   });
 });

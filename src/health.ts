@@ -31,7 +31,7 @@ export function startHealthServer(
   port: number,
   report: () => HealthReport,
   exit: (code: number) => void = (code) => process.exit(code)
-): { port: number; close(): Promise<void> } {
+): { port: number; ready: Promise<void>; close(): Promise<void> } {
   const server: Server = createServer((req, res) => {
     if (req.url !== '/healthz') {
       res.writeHead(404).end();
@@ -53,12 +53,30 @@ export function startHealthServer(
     exit(1);
   });
 
+  /**
+   * Settles when the socket is genuinely bound (or when the bind fails).
+   * `listen()` is asynchronous, so the mere fact that this function has
+   * returned does NOT mean /healthz answers yet. Boot awaits this before it
+   * starts anything slow, which is what makes "the health port is bound
+   * before the first watcher connects" a property the caller can rely on
+   * rather than a race it happens to win most of the time.
+   */
+  const ready = new Promise<void>((resolve, reject) => {
+    server.once('listening', () => resolve());
+    server.once('error', (err: Error) => reject(err));
+  });
+  // Mark `ready` as handled up front: callers that do not care about the
+  // bind result (several tests, and any future call site) must not turn a
+  // bind failure into an unhandled rejection that crashes the process.
+  ready.catch(() => undefined);
+
   server.listen(port);
 
   return {
     get port(): number {
       return (server.address() as AddressInfo).port;
     },
+    ready,
     close(): Promise<void> {
       return new Promise((resolve) => server.close(() => resolve()));
     },
