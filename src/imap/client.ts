@@ -31,9 +31,21 @@ export function imapSweepDeps(client: ImapFlow): SweepDeps {
 
     async status(path) {
       const status = await client.status(path, { uidNext: true, uidValidity: true });
+      // A missing field here must never be defaulted: defaulting uidValidity
+      // to 0 makes the sweeper think the server reset its UID space, so it
+      // silently re-baselines and destroys the real high-water mark, losing
+      // every message that arrives before the next successful STATUS call.
+      // Throwing lets the sweeper's per-folder catch record the failure and
+      // retry next sweep, leaving stored state untouched in the meantime.
+      if (status.uidNext === undefined) {
+        throw new Error(`IMAP STATUS for ${path} did not include uidNext`);
+      }
+      if (status.uidValidity === undefined) {
+        throw new Error(`IMAP STATUS for ${path} did not include uidValidity`);
+      }
       return {
-        uidNext: Number(status.uidNext ?? 1),
-        uidValidity: Number(status.uidValidity ?? 0),
+        uidNext: Number(status.uidNext),
+        uidValidity: Number(status.uidValidity),
       };
     },
 
@@ -50,12 +62,18 @@ export function imapSweepDeps(client: ImapFlow): SweepDeps {
           if (message.uid < uidFrom) continue;
           // FetchMessageObject.source is typed optional (it depends on the
           // requested query), but we always request { source: true } above,
-          // so a missing source here indicates a server/library bug worth
-          // surfacing rather than silently dropping the message.
+          // so this should be unreachable in practice. Unlike a missing
+          // STATUS field (which is transient and safe to retry by throwing),
+          // a message that never fetches a source is a per-message defect
+          // that retrying will not fix: throwing here would stop folder
+          // state from advancing and head-of-line-block every later message
+          // in this folder forever. Skip just this message and keep going;
+          // never log message content, only folder/uid.
           if (!message.source) {
-            throw new Error(
-              `IMAP fetch for ${path} uid ${message.uid} did not include a message source`
+            console.warn(
+              `[imap] skipping message with no source: folder=${path} uid=${message.uid}`
             );
+            continue;
           }
           out.push({ uid: message.uid, source: message.source });
         }

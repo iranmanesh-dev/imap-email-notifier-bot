@@ -31,6 +31,11 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
   // First time we have seen this folder, or the server reset its UID space:
   // record a baseline and notify nothing.
   if (previous === null || previous.uidValidity !== current.uidValidity) {
+    if (previous !== null) {
+      console.error(
+        `[${opts.accountLabel}] folder ${path}: uidValidity changed (${previous.uidValidity} -> ${current.uidValidity}); re-baselining`
+      );
+    }
     opts.store.setFolderState(opts.accountLabel, path, current);
     return;
   }
