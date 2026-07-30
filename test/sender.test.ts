@@ -214,3 +214,29 @@ describe('TelegramSender', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
+
+describe('deleteMessage', () => {
+  it('posts to deleteMessage and reports success', async () => {
+    const calls: string[] = [];
+    const sender = makeSender((async (url: string) => {
+      calls.push(url);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    expect(await sender.deleteMessage('42', 7)).toBe(true);
+    expect(calls[0]).toContain('/deleteMessage');
+    expect(calls[0]).not.toContain('/sendMessage');
+  });
+
+  it('reports false rather than throwing when Telegram refuses', async () => {
+    const sender = makeSender(
+      (async () => jsonResponse(400, { ok: false })) as unknown as typeof fetch
+    );
+    expect(await sender.deleteMessage('42', 7)).toBe(false);
+  });
+
+  it('reports false rather than throwing on a network error', async () => {
+    const sender = makeSender((async () => { throw new Error('ECONNRESET'); }) as unknown as typeof fetch);
+    expect(await sender.deleteMessage('42', 7)).toBe(false);
+  });
+});

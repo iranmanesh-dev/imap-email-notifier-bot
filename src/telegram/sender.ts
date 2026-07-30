@@ -21,7 +21,7 @@ function toPlainText(html: string): string {
 }
 
 export class TelegramSender {
-  readonly #url: string;
+  readonly #baseUrl: string;
   readonly #chatId: string;
   readonly #fetch: typeof fetch;
   readonly #sleep: (ms: number) => Promise<void>;
@@ -32,7 +32,7 @@ export class TelegramSender {
   #lastSentAt = 0;
 
   constructor(opts: SenderOptions) {
-    this.#url = `https://api.telegram.org/bot${opts.token}/sendMessage`;
+    this.#baseUrl = `https://api.telegram.org/bot${opts.token}`;
     this.#chatId = opts.chatId;
     this.#fetch = opts.fetchImpl ?? fetch;
     this.#sleep = opts.sleep ?? defaultSleep;
@@ -64,11 +64,29 @@ export class TelegramSender {
     };
     if (useHtml) body.parse_mode = 'HTML';
 
-    return this.#fetch(this.#url, {
+    return this.#fetch(`${this.#baseUrl}/sendMessage`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(body),
     });
+  }
+
+  /**
+   * Deletes a message in the operator's chat. Used to remove a password
+   * the operator typed. Returns false rather than throwing — the caller
+   * warns the operator to delete it manually.
+   */
+  async deleteMessage(chatId: string, messageId: number): Promise<boolean> {
+    try {
+      const res = await this.#fetch(`${this.#baseUrl}/deleteMessage`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
   }
 
   async #sendNow(html: string): Promise<SendOutcome> {

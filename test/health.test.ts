@@ -27,8 +27,10 @@ describe('buildHealthReport', () => {
     expect(buildHealthReport([{ label: 'Work', state: 'connect-failed' }]).status).toBe('degraded');
   });
 
-  it('reports degraded with no accounts at all', () => {
-    expect(buildHealthReport([]).status).toBe('degraded');
+  it('reports ok when no mailboxes are configured yet (idle, not unhealthy)', () => {
+    const report = buildHealthReport([]);
+    expect(report.status).toBe('ok');
+    expect(report.accounts).toEqual([]);
   });
 });
 

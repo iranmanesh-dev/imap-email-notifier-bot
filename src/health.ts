@@ -13,11 +13,14 @@ export type HealthReport = {
  * 'connect-failed' (the terminal state after exhausting the bounded
  * reconnect cap) without needing to be updated every time a new terminal
  * state is added to WatcherState.
+ *
+ * Zero watchers is the normal state of a fresh install: mailboxes are
+ * added at runtime via Telegram, so an empty set is idle, not unhealthy.
  */
 export function buildHealthReport(
   watchers: { label: string; state: WatcherState }[]
 ): HealthReport {
-  const healthy = watchers.length > 0 && watchers.every((w) => w.state === 'ok');
+  const healthy = watchers.every((w) => w.state === 'ok');
   return {
     status: healthy ? 'ok' : 'degraded',
     accounts: watchers.map((w) => ({ label: w.label, state: w.state })),

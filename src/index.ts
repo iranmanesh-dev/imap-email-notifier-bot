@@ -3,9 +3,16 @@ import { loadConfig } from './config.js';
 import { SeenStore } from './store/seen.js';
 import { TelegramSender } from './telegram/sender.js';
 import type { SendOutcome } from './telegram/sender.js';
-import { formatEmail } from './mail/format.js';
+import { formatEmail, escapeHtml } from './mail/format.js';
 import { AccountWatcher } from './imap/watcher.js';
 import { buildHealthReport, startHealthServer } from './health.js';
+import { deriveKey } from './crypto/secret.js';
+import { MailboxStore } from './store/mailboxes.js';
+import { WatcherRegistry } from './imap/registry.js';
+import { probeMailbox } from './imap/probe.js';
+import { Conversations } from './telegram/conversation.js';
+import { runReceiver, FatalTelegramError } from './telegram/receiver.js';
+import { handleUpdate } from './telegram/commands.js';
 import type { Account, NormalizedEmail } from './types.js';
 
 const PRUNE_AFTER_DAYS = 30;
@@ -129,6 +136,7 @@ export type ShutdownDeps = {
   store: { close(): void };
   exit: (code: number) => void;
   logger?: EmailHandlerLogger;
+  onBeforeExit?: () => Promise<void>;
 };
 
 /**
@@ -151,6 +159,14 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
   try {
     logger.log(`received ${signal}, shutting down`);
     clearInterval(deps.pruneTimer);
+
+    if (deps.onBeforeExit) {
+      try {
+        await deps.onBeforeExit();
+      } catch (err) {
+        logger.error(`pre-exit cleanup failed: ${errorMessage(err)}`);
+      }
+    }
 
     const stopResults = await Promise.allSettled(deps.watchers.map((w) => w.stop()));
     stopResults.forEach((result, i) => {
@@ -254,46 +270,96 @@ async function main(): Promise<void> {
     await sender.send(`⚠️ <b>Email notifier</b>\n${message}`);
   };
 
-  const watchers = config.mailboxes.map(
-    (account) =>
-      new AccountWatcher({
-        account,
-        store,
-        previewChars: config.previewChars,
-        sweepIntervalSeconds: config.sweepIntervalSeconds,
-        onEmail,
-        onFatal,
-      })
+  const key = deriveKey(config.masterKey);
+  const mailboxes = new MailboxStore(config.dbPath, key);
+
+  const registry = new WatcherRegistry((account) =>
+    new AccountWatcher({
+      account,
+      store,
+      previewChars: config.previewChars,
+      sweepIntervalSeconds: config.sweepIntervalSeconds,
+      onEmail,
+      onFatal,
+    })
   );
 
-  const health = startHealthServer(config.healthPort, () =>
-    buildHealthReport(watchers.map((w) => ({ label: w.label, state: w.state })))
-  );
+  // Restore whatever was configured before the last restart. A mailbox
+  // whose password cannot be decrypted is skipped loudly rather than
+  // silently dropped — silence is indistinguishable from "mail stopped".
+  for (const label of mailboxes.labels()) {
+    try {
+      const account = mailboxes.get(label);
+      if (account !== null) await registry.add(account);
+    } catch (err) {
+      const detail = errorMessage(err);
+      safeConsoleLogger.error(`[${label}] could not be restored: ${detail}`);
+      await sender.send(
+        `⚠️ Mailbox "${escapeHtml(label)}" could not be restored: ${escapeHtml(detail)}. ` +
+          `If MASTER_KEY changed, remove and re-add it.`
+      );
+    }
+  }
+
+  // Trimmed once here and reused for both the operator-chat-id comparison in
+  // handleUpdate and the deleteMessage call: trailing whitespace in the env
+  // var would make every `String(chat.id) !== operatorChatId` comparison
+  // fail, turning the bot into a silent brick with no diagnostic.
+  const operatorChatId = config.telegramChatId.trim();
+  const conversations = new Conversations();
+  const receiverAbort = new AbortController();
+
+  const receiverDone = runReceiver({
+    token: config.telegramBotToken,
+    signal: receiverAbort.signal,
+    onUpdate: (update) =>
+      handleUpdate(update, {
+        operatorChatId,
+        mailboxes,
+        seen: store,
+        registry,
+        conversations,
+        probe: probeMailbox,
+        reply: async (text) => {
+          // commands.ts deliberately emits no markup, but TelegramSender
+          // always sends with parse_mode: 'HTML' — a label or hostname
+          // containing '<' or '&' would otherwise produce a Telegram 400.
+          await sender.send(escapeHtml(text));
+        },
+        deleteMessage: (messageId) => sender.deleteMessage(operatorChatId, messageId),
+        now: () => Date.now(),
+      }),
+  }).catch((err: unknown) => {
+    if (err instanceof FatalTelegramError) {
+      safeConsoleLogger.error(`fatal: ${err.message}`);
+      process.exit(1);
+    }
+    safeConsoleLogger.error(`receiver stopped: ${errorMessage(err)}`);
+  });
+
+  const health = startHealthServer(config.healthPort, () => buildHealthReport(registry.states()));
 
   const pruneTimer = armPruneTimer(store, PRUNE_AFTER_DAYS, PRUNE_INTERVAL_MS);
 
-  safeConsoleLogger.log(`watching ${watchers.length} mailbox(es); health on :${config.healthPort}`);
-
-  // One account's failure to start must never take down the others: each
-  // watcher's own error paths are self-contained today (auth-failed /
-  // connect-failed are handled internally and never reject start()), but
-  // that safety rests on onFatal's sender.send() never throwing — a
-  // condition worth not depending on. startAllWatchers keeps every healthy
-  // account running even if one does reject, and never throws itself; the
-  // health endpoint already reports the failed account's state
-  // independently.
-  await startAllWatchers(watchers);
+  safeConsoleLogger.log(`watching ${registry.size()} mailbox(es); health on :${config.healthPort}`);
 
   let shuttingDown = false;
   const onSignal = (signal: string): void => {
     if (shuttingDown) return;
     shuttingDown = true;
     void shutdown(signal, {
-      watchers,
+      watchers: registry
+        .states()
+        .map((s) => ({ label: s.label, stop: () => registry.remove(s.label).then(() => undefined) })),
       pruneTimer,
       health,
       store,
       exit: (code) => process.exit(code),
+      onBeforeExit: async () => {
+        receiverAbort.abort();
+        await receiverDone;
+        mailboxes.close();
+      },
     });
   };
 
