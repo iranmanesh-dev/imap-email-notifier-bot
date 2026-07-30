@@ -214,3 +214,7 @@ read it, then tests the credentials before saving. Other commands: `/list`,
 **`MASTER_KEY` is not recoverable.** It encrypts every stored mailbox password. If you
 lose it or change it, stored passwords can no longer be decrypted and you must re-add
 each mailbox from scratch. Keep a copy wherever you keep your other credentials.
+
+Note that `/data` now holds those encrypted mailbox credentials as well as the dedup
+database, so treat volume backups, snapshots and volume clones as credential material —
+store them with the same care as `MASTER_KEY` itself, and keep the two apart.

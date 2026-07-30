@@ -67,11 +67,11 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
   const [command, ...args] = text.split(/\s+/);
   switch (command) {
     case '/add':
-      return startAdd(args, deps);
+      return startAdd(args, message.chat.id, deps);
     case '/list':
       return listMailboxes(deps);
     case '/remove':
-      return startRemove(args, deps);
+      return startRemove(args, message.chat.id, deps);
     case '/status':
       return showStatus(deps);
     case '/test':
@@ -84,7 +84,13 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
   }
 }
 
-async function startAdd(args: string[], deps: CommandDeps): Promise<void> {
+// `chatId` is threaded through from the incoming message rather than
+// re-derived from deps.operatorChatId. Conversations are read back with
+// message.chat.id (see handleUpdate), so keying them on
+// Number(operatorChatId) was only correct indirectly -- via the chat-id gate
+// -- and any drift between the two representations (whitespace, a non-
+// numeric id) would silently strand every pending flow.
+async function startAdd(args: string[], chatId: number, deps: CommandDeps): Promise<void> {
   if (args.length !== 4) {
     return deps.reply(`Usage: /add <label> <host> <port> <username>`);
   }
@@ -97,7 +103,7 @@ async function startAdd(args: string[], deps: CommandDeps): Promise<void> {
     return deps.reply(`A mailbox labelled "${label}" already exists. Remove it first.`);
   }
 
-  deps.conversations.set(Number(deps.operatorChatId), {
+  deps.conversations.set(chatId, {
     kind: 'password',
     label,
     host,
@@ -183,13 +189,13 @@ async function listMailboxes(deps: CommandDeps): Promise<void> {
   return deps.reply(`Configured mailboxes:\n${lines.join('\n')}`);
 }
 
-async function startRemove(args: string[], deps: CommandDeps): Promise<void> {
+async function startRemove(args: string[], chatId: number, deps: CommandDeps): Promise<void> {
   const label = args[0];
   if (label === undefined) return deps.reply('Usage: /remove <label>');
   if (!deps.mailboxes.labels().includes(label)) {
     return deps.reply(`No mailbox labelled "${label}".`);
   }
-  deps.conversations.set(Number(deps.operatorChatId), {
+  deps.conversations.set(chatId, {
     kind: 'remove-confirm',
     label,
     expiresAt: deps.now() + CONFIRM_TTL_MS,

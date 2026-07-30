@@ -66,8 +66,24 @@ describe('MailboxStore', () => {
     expect(store.get('Work')?.pass).toBe('hunter2');
   });
 
-  it('always stores secure as true regardless of input', () => {
+  it('always stores secure as true regardless of input', async () => {
+    // Asserting store.get('Work')?.secure alone cannot fail: get() builds
+    // its return value with a hardcoded `secure: true` and never reads the
+    // column. Query the column directly so this test observes what was
+    // actually persisted.
     store.add({ ...work, secure: false });
+
+    const { default: Database } = await import('better-sqlite3');
+    const db = new Database(dbPath, { readonly: true });
+    try {
+      const row = db.prepare('SELECT secure FROM mailboxes WHERE label = ?').get('Work') as
+        | { secure: number }
+        | undefined;
+      expect(row?.secure).toBe(1);
+    } finally {
+      db.close();
+    }
+
     expect(store.get('Work')?.secure).toBe(true);
   });
 
