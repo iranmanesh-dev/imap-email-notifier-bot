@@ -199,14 +199,18 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
     return deps.reply(`Cancelled. "${label}" was not removed.`);
   }
 
-  try {
-    await deps.registry.remove(label);
-  } catch (err) {
-    return deps.reply(
-      `Failed to stop the watcher for "${label}": ${errorText(err)}\n` +
-        `Nothing else was removed — its credentials and history are untouched. Try again.`
-    );
-  }
+  // No stop-failure branch here on purpose. WatcherRegistry.remove()
+  // deregisters the watcher first and swallows any stop() failure
+  // internally, so it cannot report one — and it should not: the watcher is
+  // already gone from the registry by then, so refusing to delete the
+  // credentials because a logout failed would leave the operator with a
+  // mailbox that is no longer watched but still stored.
+  //
+  // Awaiting it IS significant though: AccountWatcher.stop() drains its
+  // in-flight sweep (bounded) before resolving, which is what stops that
+  // sweep's trailing setFolderState from landing after the purge below and
+  // resurrecting the stale high-water mark.
+  await deps.registry.remove(label);
 
   try {
     deps.mailboxes.remove(label);

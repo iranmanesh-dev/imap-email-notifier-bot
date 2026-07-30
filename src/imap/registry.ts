@@ -40,6 +40,17 @@ export class WatcherRegistry {
     }
   }
 
+  /**
+   * Awaiting `stop()` here is load-bearing, not a formality: AccountWatcher's
+   * stop() drains its in-flight sweep (bounded) before resolving, and callers
+   * such as the /remove command purge the account's seen-state the moment
+   * this resolves. Anything that stops awaiting stop() would reopen the race
+   * where a straggling sweep writes its high-water mark back after the purge.
+   *
+   * Always returns true for a known label, even if stop() failed: a watcher
+   * we can no longer stop cleanly must still not be treated as live, and the
+   * caller has already been told the mailbox is going away.
+   */
   async remove(label: string): Promise<boolean> {
     const watcher = this.#watchers.get(label);
     if (watcher === undefined) return false;

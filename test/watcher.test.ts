@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ImapFlow } from 'imapflow';
 import { SeenStore } from '../src/store/seen.js';
-import { AccountWatcher } from '../src/imap/watcher.js';
+import { AccountWatcher, SWEEP_DRAIN_TIMEOUT_MS } from '../src/imap/watcher.js';
+import { WatcherRegistry } from '../src/imap/registry.js';
 import type { Account } from '../src/types.js';
 import { sweep } from '../src/imap/sweeper.js';
 
@@ -962,6 +963,150 @@ describe('AccountWatcher', () => {
       expect(connect).toHaveBeenCalledTimes(2);
       expect(watcher.state).toBe('ok');
       await watcher.stop();
+    });
+  });
+
+  // --- Final review, finding 2 (CRITICAL): stop() did not await the
+  // in-flight sweep chain ---
+  //
+  // Once fetchSince has returned, the rest of sweepFolder makes NO IMAP
+  // calls, so logging the client out does not stop it: onEmail (Telegram,
+  // >=1.1s throttle per message, up to 5 attempts with 30s backoff),
+  // markSeen, and setFolderState all still run. With a full 50-message batch
+  // that tail lasts a minute or more. /remove therefore purged seen-state
+  // while a sweep was still writing it back, resurrecting the high-water
+  // mark: re-adding the mailbox later would then NOT re-baseline and would
+  // flood the operator with the entire backlog since removal.
+
+  it('stop() waits for an in-flight sweep to finish before it resolves', async () => {
+    await withStore(async (store) => {
+      const order: string[] = [];
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+
+      let sweepCalls = 0;
+      const runSweep = vi.fn(async () => {
+        sweepCalls += 1;
+        if (sweepCalls === 2) {
+          await gate;
+          order.push('sweep-finished');
+        }
+      });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { runSweep, connect: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+      });
+
+      await watcher.start(); // sweep #1
+      const inFlight = watcher.triggerSweep(); // sweep #2, parked on the gate
+      await flushMicrotasks();
+
+      const stopPromise = watcher.stop().then(() => {
+        order.push('stop-resolved');
+      });
+      await flushMicrotasks();
+      expect(order).toEqual([]); // stop() is genuinely waiting, not resolved already
+
+      release();
+      await inFlight;
+      await stopPromise;
+
+      expect(order).toEqual(['sweep-finished', 'stop-resolved']);
+      expect(watcher.state).toBe('stopped');
+    });
+  });
+
+  it('stop() abandons a sweep that never finishes, so a stuck Telegram send cannot block removal forever', async () => {
+    vi.useFakeTimers();
+    try {
+      await withStore(async (store) => {
+        let sweepCalls = 0;
+        const runSweep = vi.fn(async () => {
+          sweepCalls += 1;
+          if (sweepCalls === 2) await new Promise<void>(() => {}); // never settles
+        });
+
+        const watcher = new AccountWatcher({
+          account,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { runSweep, connect: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        void watcher.triggerSweep(); // parks forever
+        await flushMicrotasks();
+
+        let resolved = false;
+        const stopPromise = watcher.stop().then(() => {
+          resolved = true;
+        });
+
+        await flushMicrotasks();
+        expect(resolved).toBe(false); // still draining
+
+        await vi.advanceTimersByTimeAsync(SWEEP_DRAIN_TIMEOUT_MS);
+        await stopPromise;
+
+        expect(resolved).toBe(true);
+        expect(watcher.state).toBe('stopped');
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('registry.remove() does not resolve until the in-flight sweep has written its final state, so the operator\'s purge cannot be written back over', async () => {
+    await withStore(async (store) => {
+      let sweepCalls = 0;
+      const runSweep = vi.fn(async () => {
+        sweepCalls += 1;
+        if (sweepCalls !== 2) return;
+        // Stand-in for sweepFolder's post-fetchSince tail: a slow Telegram
+        // send, then the local DB writes that follow it. None of this
+        // touches IMAP, so logging the client out cannot stop it.
+        await new Promise((r) => setTimeout(r, 50));
+        store.markSeen('Work', '<late@example.com>');
+        store.setFolderState('Work', 'INBOX', { uidNext: 99, uidValidity: 1 });
+      });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { runSweep, connect: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+      });
+      const registry = new WatcherRegistry(() => watcher);
+
+      await registry.add(account);
+      const inFlight = watcher.triggerSweep();
+      await flushMicrotasks();
+
+      // Exactly what completeRemove does: await registry.remove(label), then
+      // purge. Deliberately does NOT await the sweep first — the whole point
+      // is that remove() must be the thing that waits.
+      expect(await registry.remove('Work')).toBe(true);
+      store.purgeAccount('Work');
+
+      // Let any straggling sweep work finish, then prove it did not
+      // resurrect the state the purge just removed.
+      await inFlight;
+      expect(store.getFolderState('Work', 'INBOX')).toBeNull();
+      expect(store.hasSeen('Work', '<late@example.com>')).toBe(false);
     });
   });
 

@@ -52,6 +52,18 @@ const IDLE_WATCHDOG_MS = 12 * 60_000;
 // consecutive connection failures and give up loudly once the bound is hit.
 const MAX_CONSECUTIVE_FAILURES = 20;
 
+/**
+ * How long stop() waits for an already-running sweep to finish before giving
+ * up on it.
+ *
+ * Bounded rather than unbounded because the tail of a sweep can be parked on
+ * a Telegram send (>=1.1s throttle per message, up to 5 attempts with 30s
+ * backoff), and /remove must stay responsive: a stuck send must not block
+ * removal indefinitely. Long enough that the ordinary case — a handful of
+ * remaining messages, or a single slow send — drains completely.
+ */
+export const SWEEP_DRAIN_TIMEOUT_MS = 5000;
+
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
 export class AccountWatcher {
@@ -115,6 +127,16 @@ export class AccountWatcher {
     this.#stopIdleWatchdog();
     this.#timer = null;
 
+    // Drain BEFORE tearing the clients down. Logging the IMAP client out
+    // cannot stop a sweep that is already past fetchSince: everything after
+    // it (onEmail, markSeen, setFolderState) is local work plus Telegram,
+    // with no IMAP call left to fail. Callers rely on stop() meaning "no
+    // more writes are coming from this watcher" — WatcherRegistry.remove()
+    // awaits stop(), and commands.ts purges the account's seen-state
+    // immediately afterwards. Without this wait, that purge raced the
+    // sweep's own setFolderState and the stale high-water mark came back.
+    await this.#drainSweep();
+
     const disconnect = this.#opts.deps?.disconnect;
     if (disconnect) {
       await disconnect();
@@ -125,6 +147,45 @@ export class AccountWatcher {
     this.#sweepClient = null;
     this.#idleClient = null;
     this.#state = 'stopped';
+  }
+
+  /**
+   * Waits for the current sweep chain to settle, bounded by
+   * SWEEP_DRAIN_TIMEOUT_MS. `#sweepChain` never rejects (triggerSweep stores
+   * the caught form), so this only ever resolves.
+   *
+   * Any sweep queued but not yet started returns immediately once
+   * `#stopped` is set, so in practice this waits for at most the one sweep
+   * that was already running. Reconnects cannot extend it either:
+   * `#connectWithRetry` loops on `while (!this.#stopped)` and so returns at
+   * once rather than sleeping through its backoff.
+   */
+  async #drainSweep(): Promise<void> {
+    let settled = false;
+    const drained = this.#sweepChain.then(() => {
+      settled = true;
+    });
+
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<void>((resolve) => {
+      timer = setTimeout(resolve, SWEEP_DRAIN_TIMEOUT_MS);
+      // unref'd so a drain that finishes early cannot hold the event loop
+      // open for the remainder of the window during shutdown; cleared below
+      // for the same reason.
+      timer.unref?.();
+    });
+
+    try {
+      await Promise.race([drained, timeout]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+
+    if (!settled) {
+      console.error(
+        `[${this.#opts.account.label}] in-flight sweep did not finish within ${SWEEP_DRAIN_TIMEOUT_MS}ms of stop(); abandoning it, so a few of its remaining writes may still land`
+      );
+    }
   }
 
   /**
@@ -383,11 +444,13 @@ export class AccountWatcher {
           );
         }
       }
-      // Gate on !#stopped: stop() does not await this sweep chain, so an
-      // in-flight sweep can still be running when stop() flips #state to
-      // 'stopped'. Without this guard a straggling write here would clobber
-      // that terminal state and a shut-down account would keep reporting
-      // as 'ok' or 'reconnecting'.
+      // Gate on !#stopped: stop() flips #stopped before it starts draining
+      // this chain, so the sweep it is waiting on runs its remaining lines
+      // (this one included) with #stopped already true. Without this guard a
+      // straggling write here would clobber the terminal 'stopped' state and
+      // a shut-down account would keep reporting as 'ok' or 'reconnecting'.
+      // The guard is also the last line of defense for a sweep that outran
+      // SWEEP_DRAIN_TIMEOUT_MS and was abandoned.
       if (!this.#stopped) this.#state = 'ok';
     } catch (err) {
       if (!this.#stopped) this.#state = 'reconnecting';

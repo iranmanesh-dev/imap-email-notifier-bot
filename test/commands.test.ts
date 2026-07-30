@@ -279,25 +279,42 @@ describe('/remove', () => {
     expect(replies[0]).toMatch(/no mailbox/i);
   });
 
-  it('reports an explicit failure when the watcher fails to stop, and removes nothing else', async () => {
-    const { deps, replies, stored } = makeDeps({
+  // Deleted with the branch it covered: a "watcher fails to stop -> skip the
+  // rest" test used to live here, but WatcherRegistry.remove() catches every
+  // stop() error internally and always returns true for a known label, so
+  // that production path did not exist. See completeRemove for why reporting
+  // a stop failure would be the wrong behaviour anyway.
+
+  it('purges the seen-state only after the watcher has been stopped, never before', async () => {
+    // Ordering regression: completeRemove must not purge while the watcher
+    // could still be writing. The registry stub records the order so a
+    // future reordering of completeRemove is caught here, while
+    // watcher.test.ts covers the drain inside stop() itself.
+    const order: string[] = [];
+    const { deps } = makeDeps({
       registry: {
         add: async () => {},
-        remove: async () => {
-          throw new Error('stop failed');
+        remove: async (l: string) => {
+          await new Promise((r) => setTimeout(r, 10));
+          order.push(`stopped:${l}`);
+          return true;
         },
         has: () => false,
         states: () => [],
         size: () => 0,
       } as unknown as CommandDeps['registry'],
+      seen: {
+        purgeAccount: vi.fn((l: string) => {
+          order.push(`purged:${l}`);
+          return 3;
+        }),
+      },
     });
     deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
     await handleUpdate(msg('/remove Work'), deps);
     await handleUpdate(msg('yes'), deps);
 
-    expect(stored.size).toBe(1);
-    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
-    expect(replies.at(-1)).toMatch(/failed to stop|could not stop/i);
+    expect(order).toEqual(['stopped:Work', 'purged:Work']);
   });
 
   it('reports partial completion when removing stored credentials fails', async () => {
