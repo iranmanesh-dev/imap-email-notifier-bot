@@ -88,9 +88,9 @@ export class AccountWatcher {
     const connected = await this.#connectWithRetry(() => this.#connect());
     // Also bail if #stopped raced in during that connect: #connectSweep/
     // #connectIdle already discard the client they were holding in that
-    // case (see Finding 8), but without this check we would still overwrite
-    // a 'stopped' state with 'ok' and arm a sweep-interval timer that would
-    // outlive stop().
+    // case, but without this check we would still overwrite a 'stopped'
+    // state with 'ok' and arm a sweep-interval timer that would outlive
+    // stop().
     if (!connected || this.#stopped) return;
 
     this.#state = 'ok';
@@ -167,10 +167,9 @@ export class AccountWatcher {
           return false;
         }
 
-        // Gate on !#stopped for the same reason as the #runSweep writes
-        // (Finding 5): stop() can flip #stopped while connectFn() above was
-        // in flight, and this write must not clobber the 'stopped' state it
-        // sets afterward.
+        // Gate on !#stopped: stop() can flip #stopped while connectFn()
+        // above was in flight, and this write must not clobber the
+        // 'stopped' state it sets afterward.
         if (!this.#stopped) this.#state = 'reconnecting';
         const base = Math.min(2 ** attempt * 1000, MAX_BACKOFF_MS);
         const jitter = base * 0.2 * Math.random();
