@@ -246,7 +246,25 @@ async function showStatus(deps: CommandDeps): Promise<void> {
 async function testMailbox(args: string[], deps: CommandDeps): Promise<void> {
   const label = args[0];
   if (label === undefined) return deps.reply('Usage: /test <label>');
-  const account = deps.mailboxes.get(label);
+
+  // get() decrypts the stored password, so it throws on a wrong or rotated
+  // MASTER_KEY and on a tampered row. Unwrapped, that throw escapes
+  // handleUpdate entirely and the operator gets no reply — only a line in
+  // the container log they may never see. That is the worst possible
+  // outcome for the one command whose whole purpose is diagnosing exactly
+  // this situation.
+  let account: Account | null;
+  try {
+    account = deps.mailboxes.get(label);
+  } catch (err) {
+    // No password to scrub against here: the failure IS the decryption, so
+    // nothing in this path ever holds the plaintext.
+    return deps.reply(
+      `Could not read the stored credentials for "${label}": ${errorText(err)}\n` +
+        `If MASTER_KEY changed, that mailbox can no longer be decrypted — ` +
+        `remove it and add it again.`
+    );
+  }
   if (account === null) return deps.reply(`No mailbox labelled "${label}".`);
 
   const result = await deps.probe(account);

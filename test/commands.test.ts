@@ -379,6 +379,33 @@ describe('/status and /test', () => {
     expect(replies[0]).toMatch(/no mailbox/i);
   });
 
+  it('/test replies instead of going silent when the stored credentials cannot be decrypted', async () => {
+    // mailboxes.get() decrypts, so it throws on a rotated/wrong MASTER_KEY
+    // or a tampered row. Unwrapped, that throw escaped handleUpdate and the
+    // operator got NO reply at all — only a line in the container log. This
+    // is the single most likely reason to reach for /test: the operator
+    // rotated MASTER_KEY, saw the boot alert, and is diagnosing. Silence is
+    // indistinguishable from "mail stopped arriving".
+    const { deps, replies } = makeDeps({
+      mailboxes: {
+        add: () => {},
+        list: () => [{ label: 'Work', host: 'h', port: 993, username: 'u' }],
+        get: () => {
+          throw new Error('Unsupported state or unable to authenticate data');
+        },
+        remove: () => false,
+        labels: () => ['Work'],
+      } as unknown as CommandDeps['mailboxes'],
+    });
+
+    await expect(handleUpdate(msg('/test Work'), deps)).resolves.toBeUndefined();
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0]).toContain('Work');
+    expect(replies[0]).toMatch(/could not read|could not decrypt/i);
+    expect(replies[0]).toContain('MASTER_KEY');
+  });
+
   it('/test never leaks the password on failure', async () => {
     const { deps, replies } = makeDeps({
       probe: async () => ({ ok: false, reason: 'login failed' }),
