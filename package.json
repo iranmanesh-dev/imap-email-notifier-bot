@@ -1,7 +1,7 @@
 {
-  "name": "email-notifier",
+  "name": "imap-email-notifier-bot",
   "version": "1.0.0",
-  "description": "",
+  "description": "Self-hosted Telegram bot that notifies you of every email in any folder of any IMAP mailbox",
   "main": "index.js",
   "directories": {
     "doc": "docs"
@@ -12,9 +12,15 @@
     "start": "node dist/index.js",
     "test:integration": "vitest run --config test/integration/vitest.config.ts"
   },
-  "keywords": [],
+  "keywords": [
+    "imap",
+    "telegram",
+    "email",
+    "notifications",
+    "self-hosted"
+  ],
   "author": "",
-  "license": "ISC",
+  "license": "Apache-2.0",
   "type": "module",
   "engines": {
     "node": ">=22"

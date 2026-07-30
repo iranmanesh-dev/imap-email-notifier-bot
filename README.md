@@ -1,7 +1,46 @@
-# Email → Telegram Notifier
+# IMAP Email Notifier Bot
 
-Sends a Telegram message for every email arriving in any folder of any configured
-IMAP mailbox.
+A self-hosted Telegram bot that notifies you of **every email** arriving in **any folder**
+of **any number of IMAP mailboxes**. One small container, no third-party service in the
+middle, no polling API limits.
+
+Works with any IMAP provider — there is no provider-specific code. Tested against
+Hostinger and a real IMAP server in CI:
+
+| Provider | Host | Port |
+|---|---|---|
+| Hostinger | `imap.hostinger.com` | 993 |
+| Hostinger (Titan plans) | `imap.titan.email` | 993 |
+| Gmail / Workspace | `imap.gmail.com` | 993 (needs an [App Password](https://support.google.com/accounts/answer/185833)) |
+| Outlook / Microsoft 365 | `outlook.office365.com` | 993 |
+| iCloud | `imap.mail.me.com` | 993 (needs an app-specific password) |
+| Fastmail | `imap.fastmail.com` | 993 |
+| Self-hosted / cPanel | your mail host | 993 |
+
+### How it works
+
+An IMAP `IDLE` connection parked on INBOX gives near-instant delivery, while a cheap
+`STATUS (UIDNEXT)` sweep covers every other folder on a timer. That keeps it at **two IMAP
+connections per account regardless of folder count** — important because most providers cap
+concurrent connections around 10–15. The idler is only a latency optimisation: if it dies,
+mail arrives a sweep later rather than never.
+
+Notifications are deduplicated in SQLite on `(account, Message-ID)`, so a message moved
+between folders notifies once, while the same message arriving in two different mailboxes
+notifies once per mailbox.
+
+### Design notes worth knowing
+
+- **Delivery is at-least-once.** A message is marked seen only *after* Telegram accepts it,
+  so a crash between the two yields one duplicate rather than a silently lost email.
+- **First run notifies nothing.** It records a baseline so booting against an existing
+  mailbox doesn't dump your history into Telegram.
+- **The healthcheck is liveness-only.** A degraded account never triggers a container
+  restart, because a restart can't fix an unreachable host or a wrong password — it only
+  resets the backoff and the failure cap.
+
+The full design rationale, including the failure modes each decision guards against, is in
+[`docs/superpowers/specs/`](docs/superpowers/specs/).
 
 ## Setup
 
