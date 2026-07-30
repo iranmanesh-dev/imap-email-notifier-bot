@@ -32,6 +32,37 @@ describe('buildHealthReport', () => {
   });
 });
 
+describe('startHealthServer error handling (Finding 8)', () => {
+  // A bare server.listen(port) has no 'error' listener. EADDRINUSE (the
+  // realistic case: two containers/processes racing for the same port)
+  // becomes an uncaught exception well after main() has returned, surfacing
+  // as a raw stack instead of a clean fatal exit. This is the same class of
+  // bug as Finding 1 (an unguarded EventEmitter 'error' path killing the
+  // process) applied to the health server instead of an IMAP client.
+
+  it('routes a listen error through the injected exit callback instead of letting it become an uncaught exception', async () => {
+    const serverA = startHealthServer(0, () => buildHealthReport([{ label: 'Work', state: 'ok' }]));
+    const port = serverA.port;
+    const exit = vi.fn();
+
+    // Binding a second server to the exact same port forces a real
+    // EADDRINUSE from the OS -- the realistic failure this finding
+    // describes, not a synthetic stand-in for it.
+    const serverB = startHealthServer(
+      port,
+      () => buildHealthReport([{ label: 'Work', state: 'ok' }]),
+      exit
+    );
+
+    await vi.waitFor(() => {
+      expect(exit).toHaveBeenCalledWith(1);
+    });
+
+    await serverA.close();
+    await serverB.close();
+  });
+});
+
 describe('startHealthServer', () => {
   it('serves the report as JSON on /healthz', async () => {
     const server = startHealthServer(0, () => buildHealthReport([{ label: 'Work', state: 'ok' }]));
