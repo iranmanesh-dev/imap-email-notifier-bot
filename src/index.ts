@@ -59,6 +59,16 @@ function toSafeLogger(logger: EmailHandlerLogger): EmailHandlerLogger {
 }
 
 /**
+ * The safe wrapper around the raw console, used by every logging call site
+ * in this module outside of createEmailHandler/shutdown (which each wrap
+ * their own injected logger). No `console.log`/`console.error` call anywhere
+ * in main()'s startup, steady-state, or shutdown paths should be raw: a
+ * throw from the console (EPIPE on a closed stdout is the standing example
+ * in this codebase) must never be able to take the process down.
+ */
+const safeConsoleLogger: EmailHandlerLogger = toSafeLogger(consoleLogger);
+
+/**
  * Builds the sweeper's onEmail callback. Extracted from main() (rather than
  * an inline closure, as the original design had it) so it is independently
  * testable: the sweeper marks a message as seen only AFTER onEmail resolves,
@@ -166,6 +176,45 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
   }
 }
 
+/** Minimal shape `startAllWatchers` needs from an AccountWatcher, so tests can pass a stub. */
+export type StartableWatcher = {
+  label: string;
+  start(): Promise<void>;
+};
+
+/**
+ * Starts every watcher concurrently and never rejects, no matter how many
+ * (or how badly) individual starts fail. Extracted from main() (mirroring
+ * the createEmailHandler/shutdown extractions) after a review finding: the
+ * previous inline version logged a failed start via a raw `console.error`
+ * inside a `Promise.allSettled` forEach. Had that raw call thrown (EPIPE on
+ * closed stdout is the standing example in this codebase), the throw would
+ * have propagated synchronously out of the forEach and out of main() itself
+ * — hitting the bottom-level `.catch` -> `process.exit(1)` and killing every
+ * already-started healthy watcher, before the SIGTERM/SIGINT handlers were
+ * even registered. That would have defeated the entire point of using
+ * `allSettled` here in the first place.
+ *
+ * `Promise.allSettled` alone already guarantees every watcher's `start()` is
+ * invoked and awaited regardless of any other watcher's outcome; routing the
+ * failure log through the safe logger closes the remaining gap, so nothing
+ * in this function can throw synchronously and stop main() from reaching
+ * its next statement.
+ */
+export async function startAllWatchers(
+  watchers: StartableWatcher[],
+  logger: EmailHandlerLogger = consoleLogger
+): Promise<void> {
+  const safeLogger = toSafeLogger(logger);
+  const startResults = await Promise.allSettled(watchers.map((w) => w.start()));
+  startResults.forEach((result, i) => {
+    if (result.status === 'rejected') {
+      const label = watchers[i]?.label ?? `#${i}`;
+      safeLogger.error(`[${label}] failed to start: ${errorMessage(result.reason)}`);
+    }
+  });
+}
+
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   const store = new SeenStore(config.dbPath);
@@ -202,25 +251,20 @@ async function main(): Promise<void> {
 
   const pruneTimer = setInterval(() => {
     const removed = store.prune(PRUNE_AFTER_DAYS);
-    if (removed > 0) console.log(`pruned ${removed} seen-message records`);
+    if (removed > 0) safeConsoleLogger.log(`pruned ${removed} seen-message records`);
   }, PRUNE_INTERVAL_MS);
 
-  console.log(`watching ${watchers.length} mailbox(es); health on :${config.healthPort}`);
+  safeConsoleLogger.log(`watching ${watchers.length} mailbox(es); health on :${config.healthPort}`);
 
   // One account's failure to start must never take down the others: each
   // watcher's own error paths are self-contained today (auth-failed /
   // connect-failed are handled internally and never reject start()), but
   // that safety rests on onFatal's sender.send() never throwing — a
-  // condition worth not depending on. allSettled + per-account logging keeps
-  // every healthy account running even if one does reject; the health
-  // endpoint already reports the failed account's state independently.
-  const startResults = await Promise.allSettled(watchers.map((w) => w.start()));
-  startResults.forEach((result, i) => {
-    if (result.status === 'rejected') {
-      const label = watchers[i]?.label ?? `#${i}`;
-      console.error(`[${label}] failed to start: ${errorMessage(result.reason)}`);
-    }
-  });
+  // condition worth not depending on. startAllWatchers keeps every healthy
+  // account running even if one does reject, and never throws itself; the
+  // health endpoint already reports the failed account's state
+  // independently.
+  await startAllWatchers(watchers);
 
   let shuttingDown = false;
   const onSignal = (signal: string): void => {
@@ -256,7 +300,11 @@ const isMainModule =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMainModule) {
   main().catch((err: unknown) => {
-    console.error(`fatal: ${(err as Error).message}`);
+    // Routed through the safe logger for the same reason as every other
+    // console call in this module: this is the last-resort boot-failure
+    // path, and a throw here (e.g. EPIPE) must not prevent the process.exit
+    // that follows it.
+    safeConsoleLogger.error(`fatal: ${errorMessage(err)}`);
     process.exit(1);
   });
 }

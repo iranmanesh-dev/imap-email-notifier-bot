@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
-import { createEmailHandler, shutdown } from '../src/index.js';
+import { createEmailHandler, shutdown, startAllWatchers } from '../src/index.js';
 import type { NormalizedEmail } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
@@ -274,5 +274,56 @@ describe('shutdown', () => {
 
     expect(exit).toHaveBeenCalledWith(0);
     expect(exit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('startAllWatchers', () => {
+  it('starts every watcher (including ones after a failing one) and never throws, even when the logger used to report a failed start itself throws (e.g. EPIPE)', async () => {
+    // This is the Finding-5 regression: main() previously logged a failed
+    // watcher start via a raw console.error inside a Promise.allSettled
+    // forEach. If that raw call threw (EPIPE on closed stdout), the throw
+    // propagated synchronously out of the forEach and out of main() itself,
+    // hitting the bottom-level `.catch` -> process.exit(1) and taking down
+    // every already-started healthy watcher — before SIGTERM/SIGINT
+    // handlers were even registered. Proving this function resolves
+    // (instead of throwing) when its logger explodes is what guarantees
+    // main()'s subsequent statements — including registering the signal
+    // handlers — are still reached, since main() is straight-line
+    // sequential code with nothing else that could stop it there.
+    const healthy = { label: 'Healthy', start: vi.fn(async (): Promise<void> => {}) };
+    const failing = {
+      label: 'Failing',
+      start: vi.fn(async (): Promise<void> => {
+        throw new Error('connect-failed');
+      }),
+    };
+    const throwingLogger = {
+      log: vi.fn(() => {
+        throw new Error('EPIPE');
+      }),
+      error: vi.fn(() => {
+        throw new Error('EPIPE');
+      }),
+    };
+
+    await expect(startAllWatchers([healthy, failing], throwingLogger)).resolves.toBeUndefined();
+
+    expect(healthy.start).toHaveBeenCalledTimes(1);
+    expect(failing.start).toHaveBeenCalledTimes(1);
+    // The attempt to log the failure happened (and was swallowed) rather
+    // than being skipped or crashing the function outright.
+    expect(throwingLogger.error).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs nothing when every watcher starts successfully', async () => {
+    const a = { label: 'A', start: vi.fn(async (): Promise<void> => {}) };
+    const b = { label: 'B', start: vi.fn(async (): Promise<void> => {}) };
+    const logger = { log: vi.fn(), error: vi.fn() };
+
+    await startAllWatchers([a, b], logger);
+
+    expect(a.start).toHaveBeenCalledTimes(1);
+    expect(b.start).toHaveBeenCalledTimes(1);
+    expect(logger.error).not.toHaveBeenCalled();
   });
 });
