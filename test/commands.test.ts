@@ -29,6 +29,7 @@ function makeDeps(overrides: Partial<CommandDeps> = {}) {
       })),
       get: (l: string) => stored.get(l) ?? null,
       remove: (l: string) => stored.delete(l),
+      labels: () => [...stored.keys()],
     } as unknown as CommandDeps['mailboxes'],
     seen: { purgeAccount: vi.fn(() => 3) },
     registry: {
@@ -65,6 +66,24 @@ describe('authorization', () => {
     const { deps, replies } = makeDeps();
     await handleUpdate({ update_id: 1 }, deps);
     expect(replies).toEqual([]);
+  });
+
+  it('ignores an update whose message has no chat', async () => {
+    const { deps, replies } = makeDeps();
+    const update = { update_id: 1, message: { message_id: 1, text: '/list' } } as unknown as TelegramUpdate;
+    await handleUpdate(update, deps);
+    expect(replies).toEqual([]);
+  });
+
+  it('touches nothing at all for an unauthorized chat — no probe, no delete, no store write', async () => {
+    const probe = vi.fn(async () => ({ ok: true, folders: 5 }) as const);
+    const deleteMessage = vi.fn(async () => true);
+    const { deps, replies, stored } = makeDeps({ probe, deleteMessage });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com', 999), deps);
+    expect(replies).toEqual([]);
+    expect(probe).not.toHaveBeenCalled();
+    expect(deleteMessage).not.toHaveBeenCalled();
+    expect(stored.size).toBe(0);
   });
 });
 
@@ -132,6 +151,69 @@ describe('/add', () => {
     expect(replies.join('\n')).not.toContain('s3cret');
   });
 
+  it('never echoes the password in the probe-failure reply', async () => {
+    const { deps, replies } = makeDeps({
+      probe: async () => ({ ok: false, reason: 'AUTHENTICATIONFAILED' }),
+    });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('s3cret-pw', OPERATOR, 81), deps);
+    expect(replies.join('\n')).not.toContain('s3cret-pw');
+  });
+
+  it('never echoes the password in the delete-failure warning', async () => {
+    const { deps, replies } = makeDeps({ deleteMessage: async () => false });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('s3cret-pw', OPERATOR, 82), deps);
+    expect(replies.join('\n')).not.toContain('s3cret-pw');
+  });
+
+  it('never echoes the password when mailboxes.add throws an error containing it', async () => {
+    const { deps, replies } = makeDeps({
+      mailboxes: {
+        add: (a: Account) => {
+          throw new Error(`db locked, could not store password "${a.pass}"`);
+        },
+        list: () => [],
+        get: () => null,
+        remove: () => false,
+        labels: () => [],
+      } as unknown as CommandDeps['mailboxes'],
+    });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('leaked-secret', OPERATOR, 83), deps);
+    expect(replies.join('\n')).not.toContain('leaked-secret');
+  });
+
+  it('reports a distinct failure when the watcher fails to start after the mailbox was saved', async () => {
+    const { deps, replies, stored } = makeDeps({
+      registry: {
+        add: async () => {
+          throw new Error('watcher start failed');
+        },
+        remove: async () => false,
+        has: () => false,
+        states: () => [],
+        size: () => 0,
+      } as unknown as CommandDeps['registry'],
+    });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('s3cret', OPERATOR, 90), deps);
+
+    expect(stored.get('Work')?.pass).toBe('s3cret');
+    expect(replies.at(-1)).toMatch(/saved/i);
+    expect(replies.at(-1)).toMatch(/not watching|failed to start watching/i);
+    expect(replies.at(-1)).not.toMatch(/^Failed to save/);
+  });
+
+  it('announces a cancelled pending password prompt when a command arrives instead', async () => {
+    const { deps, replies } = makeDeps();
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('/status'), deps);
+
+    expect(replies.some((r) => /cancel/i.test(r) && /work/i.test(r))).toBe(true);
+    expect(replies.at(-1)).toMatch(/no mailboxes/i);
+  });
+
   it('ignores a bare message when nothing is pending', async () => {
     const { deps, replies } = makeDeps();
     await handleUpdate(msg('just chatting'), deps);
@@ -195,6 +277,60 @@ describe('/remove', () => {
     const { deps, replies } = makeDeps();
     await handleUpdate(msg('/remove Ghost'), deps);
     expect(replies[0]).toMatch(/no mailbox/i);
+  });
+
+  it('reports an explicit failure when the watcher fails to stop, and removes nothing else', async () => {
+    const { deps, replies, stored } = makeDeps({
+      registry: {
+        add: async () => {},
+        remove: async () => {
+          throw new Error('stop failed');
+        },
+        has: () => false,
+        states: () => [],
+        size: () => 0,
+      } as unknown as CommandDeps['registry'],
+    });
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await handleUpdate(msg('/remove Work'), deps);
+    await handleUpdate(msg('yes'), deps);
+
+    expect(stored.size).toBe(1);
+    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
+    expect(replies.at(-1)).toMatch(/failed to stop|could not stop/i);
+  });
+
+  it('reports partial completion when removing stored credentials fails', async () => {
+    const { deps, replies } = makeDeps({
+      mailboxes: {
+        add: () => {},
+        list: () => [{ label: 'Work', host: 'h', port: 993, username: 'u' }],
+        get: (l: string) =>
+          l === 'Work' ? { label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true } : null,
+        remove: () => {
+          throw new Error('disk error');
+        },
+        labels: () => ['Work'],
+      } as unknown as CommandDeps['mailboxes'],
+    });
+    await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await handleUpdate(msg('/remove Work'), deps);
+    await handleUpdate(msg('yes'), deps);
+
+    expect(deps.registry.has('Work')).toBe(false);
+    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
+    expect(replies.at(-1)).toMatch(/stopped watching|credentials/i);
+  });
+
+  it('announces a cancelled pending removal confirmation when a command arrives instead', async () => {
+    const { deps, replies, stored } = makeDeps();
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await handleUpdate(msg('/remove Work'), deps);
+    await handleUpdate(msg('/list'), deps);
+
+    expect(replies.some((r) => /cancel/i.test(r) && /work/i.test(r))).toBe(true);
+    expect(stored.size).toBe(1);
+    expect(replies.at(-1)).toContain('Work');
   });
 });
 

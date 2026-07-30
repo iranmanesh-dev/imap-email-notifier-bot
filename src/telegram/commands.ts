@@ -36,19 +36,31 @@ const USAGE = [
 export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): Promise<void> {
   const message = update.message;
   if (message === undefined) return;
+  // The receiver only validates `update_id`, so `chat` is not guaranteed to
+  // exist at runtime despite the type. Fail closed and stay silent.
+  if (message.chat?.id === undefined) return;
   if (String(message.chat.id) !== deps.operatorChatId) return;
 
   const text = (message.text ?? '').trim();
   if (text.length === 0) return;
 
   const pending = deps.conversations.take(message.chat.id, deps.now());
-  if (pending !== null && !text.startsWith('/')) {
-    if (pending.kind === 'password') {
-      await completeAdd(pending, text, message.message_id, deps);
-    } else {
-      await completeRemove(pending.label, text, deps);
+  if (pending !== null) {
+    if (!text.startsWith('/')) {
+      if (pending.kind === 'password') {
+        await completeAdd(pending, text, message.message_id, deps);
+      } else {
+        await completeRemove(pending.label, text, deps);
+      }
+      return;
     }
-    return;
+    // A `/`-prefixed message during a pending flow must be treated as a
+    // command, not as the pending answer — otherwise a mistyped command
+    // mid-flow would be stored as a password or a removal confirmation.
+    // The pending state is already discarded (take() is single-use); tell
+    // the operator so they can't mistake this for "password accepted".
+    const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
+    await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
   }
 
   const [command, ...args] = text.split(/\s+/);
@@ -80,7 +92,7 @@ async function startAdd(args: string[], deps: CommandDeps): Promise<void> {
   if (!Number.isInteger(port) || port <= 0 || port > 65535) {
     return deps.reply(`Invalid port "${portText}" — expected a number between 1 and 65535.`);
   }
-  if (deps.mailboxes.get(label) !== null) {
+  if (deps.mailboxes.labels().includes(label)) {
     return deps.reply(`A mailbox labelled "${label}" already exists. Remove it first.`);
   }
 
@@ -128,9 +140,23 @@ async function completeAdd(
 
   try {
     deps.mailboxes.add(account);
+  } catch (err) {
+    // Failed before persisting anything — nothing to clean up.
+    return deps.reply(`Failed to save: ${scrubPassword(errorText(err), password)}`);
+  }
+
+  try {
     await deps.registry.add(account);
   } catch (err) {
-    return deps.reply(`Failed to save: ${errorText(err)}`);
+    // The mailbox WAS persisted here — a bare "Failed to save" would be a
+    // lie, and would leave an orphaned, unwatched mailbox the operator
+    // believes doesn't exist, blocking a later /add with the same label.
+    return deps.reply(
+      `Saved "${account.label}", but failed to start watching it: ` +
+        `${scrubPassword(errorText(err), password)}\n` +
+        `It is not being monitored. Run /remove "${account.label}" and add it again, ` +
+        `or restart the bot to retry starting the watcher.`
+    );
   }
 
   return deps.reply(
@@ -153,7 +179,7 @@ async function listMailboxes(deps: CommandDeps): Promise<void> {
 async function startRemove(args: string[], deps: CommandDeps): Promise<void> {
   const label = args[0];
   if (label === undefined) return deps.reply('Usage: /remove <label>');
-  if (deps.mailboxes.get(label) === null) {
+  if (!deps.mailboxes.labels().includes(label)) {
     return deps.reply(`No mailbox labelled "${label}".`);
   }
   deps.conversations.set(Number(deps.operatorChatId), {
@@ -172,9 +198,35 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
   if (answer.toLowerCase() !== 'yes') {
     return deps.reply(`Cancelled. "${label}" was not removed.`);
   }
-  await deps.registry.remove(label);
-  deps.mailboxes.remove(label);
-  deps.seen.purgeAccount(label);
+
+  try {
+    await deps.registry.remove(label);
+  } catch (err) {
+    return deps.reply(
+      `Failed to stop the watcher for "${label}": ${errorText(err)}\n` +
+        `Nothing else was removed — its credentials and history are untouched. Try again.`
+    );
+  }
+
+  try {
+    deps.mailboxes.remove(label);
+  } catch (err) {
+    return deps.reply(
+      `Stopped watching "${label}", but failed to remove its stored credentials: ` +
+        `${errorText(err)}\nIts notification history was not purged either. ` +
+        `You may need to remove it manually.`
+    );
+  }
+
+  try {
+    deps.seen.purgeAccount(label);
+  } catch (err) {
+    return deps.reply(
+      `Removed "${label}" and stopped watching it, but failed to purge its ` +
+        `notification history: ${errorText(err)}`
+    );
+  }
+
   return deps.reply(`Removed "${label}" and stopped watching it.`);
 }
 
@@ -201,4 +253,14 @@ async function testMailbox(args: string[], deps: CommandDeps): Promise<void> {
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Strips a raw password out of arbitrary error text before it reaches a
+ * reply. A thrown error (e.g. from the store) could echo its input, so this
+ * is scrubbed at the boundary the same way probeMailbox scrubs IMAP errors.
+ */
+function scrubPassword(text: string, password: string): string {
+  if (password.length === 0) return text;
+  return text.split(password).join('***');
 }
