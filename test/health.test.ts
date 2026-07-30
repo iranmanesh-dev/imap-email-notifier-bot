@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
-import { createEmailHandler } from '../src/index.js';
+import { createEmailHandler, shutdown } from '../src/index.js';
 import type { NormalizedEmail } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
@@ -124,5 +124,155 @@ describe('createEmailHandler', () => {
     const handler = createEmailHandler(sender, logger);
     await expect(handler(email)).resolves.toBeUndefined();
     expect(logger.error).toHaveBeenCalledTimes(1);
+  });
+
+  it('never rejects even when the injected logger itself throws on every call (e.g. EPIPE on a closed stdout)', async () => {
+    const throwingLogger = {
+      log: vi.fn(() => {
+        throw new Error('EPIPE');
+      }),
+      error: vi.fn(() => {
+        throw new Error('EPIPE');
+      }),
+    };
+
+    // Exercise all three call sites that log: the 'sent' path (logger.log),
+    // the 'dropped' path (logger.error), and the unexpected-throw path
+    // (logger.error). None of them may let the logger's own throw escape.
+    const sentSender = { send: vi.fn(async (): Promise<SendOutcome> => 'sent') };
+    await expect(createEmailHandler(sentSender, throwingLogger)(email)).resolves.toBeUndefined();
+
+    const droppedSender = { send: vi.fn(async (): Promise<SendOutcome> => 'dropped') };
+    await expect(
+      createEmailHandler(droppedSender, throwingLogger)(email)
+    ).resolves.toBeUndefined();
+
+    const throwingSender = {
+      send: vi.fn(async (): Promise<SendOutcome> => {
+        throw new Error('unexpected boom');
+      }),
+    };
+    await expect(
+      createEmailHandler(throwingSender, throwingLogger)(email)
+    ).resolves.toBeUndefined();
+  });
+});
+
+describe('shutdown', () => {
+  function fakeWatcher(label: string, stop: () => Promise<void>) {
+    return { label, stop: vi.fn(stop) };
+  }
+
+  it('stops every watcher, closes the health server and store, and exits 0 on the happy path', async () => {
+    const watcherA = fakeWatcher('A', async () => {});
+    const watcherB = fakeWatcher('B', async () => {});
+    const health = { close: vi.fn(async () => {}) };
+    const store = { close: vi.fn(() => {}) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', {
+      watchers: [watcherA, watcherB],
+      pruneTimer,
+      health,
+      store,
+      exit,
+    });
+
+    expect(watcherA.stop).toHaveBeenCalledTimes(1);
+    expect(watcherB.stop).toHaveBeenCalledTimes(1);
+    expect(health.close).toHaveBeenCalledTimes(1);
+    expect(store.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still stops the other watchers, closes the store, and exits 0 when one watcher fails to stop', async () => {
+    const watcherA = fakeWatcher('A', async () => {
+      throw new Error('logout failed');
+    });
+    const watcherB = fakeWatcher('B', async () => {});
+    const health = { close: vi.fn(async () => {}) };
+    const store = { close: vi.fn(() => {}) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', {
+      watchers: [watcherA, watcherB],
+      pruneTimer,
+      health,
+      store,
+      exit,
+    });
+
+    expect(watcherB.stop).toHaveBeenCalledTimes(1);
+    expect(health.close).toHaveBeenCalledTimes(1);
+    expect(store.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still closes the store and exits 0 when the health server fails to close', async () => {
+    const watcher = fakeWatcher('A', async () => {});
+    const health = {
+      close: vi.fn(async () => {
+        throw new Error('EPIPE');
+      }),
+    };
+    const store = { close: vi.fn(() => {}) };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, exit });
+
+    expect(store.close).toHaveBeenCalledTimes(1);
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('still exits 0 when the store fails to close (the realistic better-sqlite3 case)', async () => {
+    const watcher = fakeWatcher('A', async () => {});
+    const health = { close: vi.fn(async () => {}) };
+    const store = {
+      close: vi.fn(() => {
+        throw new Error('disk I/O error');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+
+    await shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, exit });
+
+    expect(exit).toHaveBeenCalledWith(0);
+  });
+
+  it('always exits 0, never rejects, and clears the prune timer, even when everything (including the logger) throws', async () => {
+    const watcher = fakeWatcher('A', async () => {
+      throw new Error('logout failed');
+    });
+    const health = {
+      close: vi.fn(async () => {
+        throw new Error('EPIPE');
+      }),
+    };
+    const store = {
+      close: vi.fn(() => {
+        throw new Error('disk I/O error');
+      }),
+    };
+    const exit = vi.fn();
+    const pruneTimer = setInterval(() => {}, 1_000_000);
+    const logger = {
+      log: vi.fn(() => {
+        throw new Error('log throws');
+      }),
+      error: vi.fn(() => {
+        throw new Error('error throws');
+      }),
+    };
+
+    await expect(
+      shutdown('SIGTERM', { watchers: [watcher], pruneTimer, health, store, exit, logger })
+    ).resolves.toBeUndefined();
+
+    expect(exit).toHaveBeenCalledWith(0);
+    expect(exit).toHaveBeenCalledTimes(1);
   });
 });
