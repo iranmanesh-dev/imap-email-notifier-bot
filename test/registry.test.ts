@@ -51,13 +51,19 @@ describe('WatcherRegistry', () => {
   });
 
   it('does not leave a registration behind when start() fails', async () => {
+    let startedWithRegistration = false;
     const reg = new WatcherRegistry(() => ({
       label: 'Work',
       state: 'starting' as WatcherState,
-      async start() { throw new Error('connect failed'); },
+      async start() {
+        // Assert that the registry does not already contain this label at start time
+        startedWithRegistration = reg.has('Work');
+        throw new Error('connect failed');
+      },
       async stop() {},
     }));
     await expect(reg.add(account)).rejects.toThrow(/connect failed/);
+    expect(startedWithRegistration).toBe(false); // Verify it was not registered before start
     expect(reg.has('Work')).toBe(false);
   });
 
@@ -109,5 +115,63 @@ describe('WatcherRegistry', () => {
     await reg.stopAll();
     expect(stopped).toBe(1);
     expect(reg.size()).toBe(0);
+  });
+
+  it('concurrent adds for the same label create only one watcher', async () => {
+    let factoryCalls = 0;
+    const reg = new WatcherRegistry((a) => {
+      factoryCalls += 1;
+      return fakeWatcher(a.label);
+    });
+    const results = await Promise.allSettled([
+      reg.add(account),
+      reg.add(account),
+    ]);
+    expect(factoryCalls).toBe(1); // Factory called exactly once
+    expect(results[0]!.status).toBe('fulfilled');
+    expect(results[1]!.status).toBe('rejected'); // Second call rejected
+    expect(reg.size()).toBe(1);
+  });
+
+  it('after concurrent-add rejection, a later add with the same label succeeds', async () => {
+    // Simulate a race where two adds for the same label happen concurrently
+    const reg = new WatcherRegistry((a) => fakeWatcher(a.label));
+    const results = await Promise.allSettled([
+      reg.add(account),
+      reg.add(account),
+    ]);
+    expect(results.some((r) => r.status === 'fulfilled')).toBe(true);
+    expect(results.some((r) => r.status === 'rejected')).toBe(true);
+    expect(reg.size()).toBe(1);
+
+    // After the race resolves and the label is registered, remove it
+    await reg.remove('Work');
+    expect(reg.size()).toBe(0);
+
+    // Now a new add should succeed (proving in-flight was cleared from the failed attempt)
+    await reg.add(account);
+    expect(reg.has('Work')).toBe(true);
+  });
+
+  it('a failed start() clears the in-flight entry so retry works', async () => {
+    let attempts = 0;
+    const reg = new WatcherRegistry(() => ({
+      label: 'Work',
+      state: 'starting' as WatcherState,
+      async start() {
+        attempts += 1;
+        if (attempts === 1) throw new Error('network down');
+        // Second attempt succeeds
+      },
+      async stop() {},
+    }));
+    // First attempt fails
+    await expect(reg.add(account)).rejects.toThrow(/network down/);
+    expect(reg.has('Work')).toBe(false);
+    expect(attempts).toBe(1);
+    // Second attempt should work (in-flight was cleared)
+    await reg.add(account);
+    expect(reg.has('Work')).toBe(true);
+    expect(attempts).toBe(2);
   });
 });

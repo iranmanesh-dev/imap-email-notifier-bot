@@ -18,20 +18,26 @@ export type WatcherFactory = (account: Account) => ManagedWatcher;
 export class WatcherRegistry {
   readonly #factory: WatcherFactory;
   readonly #watchers = new Map<string, ManagedWatcher>();
+  readonly #inFlight = new Set<string>();
 
   constructor(factory: WatcherFactory) {
     this.#factory = factory;
   }
 
   async add(account: Account): Promise<void> {
-    if (this.#watchers.has(account.label)) {
+    if (this.#watchers.has(account.label) || this.#inFlight.has(account.label)) {
       throw new Error(`a watcher for "${account.label}" is already running`);
     }
-    const watcher = this.#factory(account);
-    // Register only after a successful start, so a failed start cannot
-    // leave a dead entry that blocks a later retry with the same label.
-    await watcher.start();
-    this.#watchers.set(account.label, watcher);
+    this.#inFlight.add(account.label);
+    try {
+      const watcher = this.#factory(account);
+      // Register only after a successful start, so a failed start cannot
+      // leave a dead entry that blocks a later retry with the same label.
+      await watcher.start();
+      this.#watchers.set(account.label, watcher);
+    } finally {
+      this.#inFlight.delete(account.label);
+    }
   }
 
   async remove(label: string): Promise<boolean> {
