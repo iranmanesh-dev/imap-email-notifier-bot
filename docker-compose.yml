@@ -1,0 +1,17 @@
+services:
+  notifier:
+    build: .
+    restart: unless-stopped
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      MAILBOXES: ${MAILBOXES}
+      SWEEP_INTERVAL_SECONDS: ${SWEEP_INTERVAL_SECONDS:-60}
+      PREVIEW_CHARS: ${PREVIEW_CHARS:-200}
+      DB_PATH: /data/seen.db
+      HEALTH_PORT: 8080
+    volumes:
+      - notifier-data:/data
+
+volumes:
+  notifier-data:
