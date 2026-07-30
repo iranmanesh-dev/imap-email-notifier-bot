@@ -111,6 +111,65 @@ describe('runReceiver', () => {
     expect(urls.filter((u) => u.includes('deleteWebhook')).length).toBeGreaterThanOrEqual(2);
   });
 
+  it('backs off between repeated 409 conflicts instead of spinning', async () => {
+    const sleepDurations: number[] = [];
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+      return jsonResponse(409, { ok: false });
+    }) as unknown as typeof fetch;
+
+    const controller = new AbortController();
+    let seen = 0;
+    const counting = (async (...args: Parameters<typeof fetch>) => {
+      seen += 1;
+      const res = await (fetchImpl as (...a: Parameters<typeof fetch>) => Promise<Response>)(...args);
+      if (seen >= 6) controller.abort();
+      return res;
+    }) as unknown as typeof fetch;
+
+    await runReceiver({
+      token: 'T',
+      onUpdate: async () => {},
+      signal: controller.signal,
+      fetchImpl: counting,
+      sleep: async (ms) => { sleepDurations.push(ms); },
+    });
+
+    expect(sleepDurations.length).toBeGreaterThan(0);
+    expect(sleepDurations.every((ms) => ms > 0)).toBe(true);
+  });
+
+  it('ignores a non-array result instead of crashing the receiver', async () => {
+    const fetchImpl = (async (url: string) =>
+      url.includes('deleteWebhook')
+        ? jsonResponse(200, { ok: true })
+        : jsonResponse(200, { ok: true, result: 42 })) as unknown as typeof fetch;
+
+    await expect(runUntil(fetchImpl, 3, async () => {})).resolves.toBeUndefined();
+  });
+
+  it('skips an update missing update_id without corrupting the offset', async () => {
+    const urls: string[] = [];
+    let poll = 0;
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+      urls.push(url);
+      poll += 1;
+      if (poll === 1) {
+        return jsonResponse(200, {
+          ok: true,
+          result: [{ message: { message_id: 1, chat: { id: 1 }, text: 'no id' } }, update(7, '/list')],
+        });
+      }
+      return okUpdates([]);
+    }) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 3, async () => {});
+    expect(urls[0]).toContain('offset=0');
+    expect(urls[1]).toContain('offset=8');
+    expect(urls[1]).not.toContain('NaN');
+  });
+
   it('throws FatalTelegramError on 401 rather than retrying forever', async () => {
     const fetchImpl = (async (url: string) =>
       url.includes('deleteWebhook')
@@ -137,18 +196,35 @@ describe('runReceiver', () => {
     expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('never puts the bot token in a thrown error message', async () => {
+  it('never puts the bot token in a thrown error message or a logged line', async () => {
     const fetchImpl = (async (url: string) =>
       url.includes('deleteWebhook')
         ? jsonResponse(200, { ok: true })
         : jsonResponse(401, { ok: false })) as unknown as typeof fetch;
 
-    const controller = new AbortController();
-    await expect(
-      runReceiver({
-        token: 'SUPERSECRETTOKEN', onUpdate: async () => {}, signal: controller.signal,
-        fetchImpl, sleep: async () => {},
-      })
-    ).rejects.toThrow(expect.not.stringContaining('SUPERSECRETTOKEN') as unknown as string);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const controller = new AbortController();
+      let caught: unknown;
+      try {
+        await runReceiver({
+          token: 'SUPERSECRETTOKEN', onUpdate: async () => {}, signal: controller.signal,
+          fetchImpl, sleep: async () => {},
+        });
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(FatalTelegramError);
+      expect((caught as Error).message).not.toContain('SUPERSECRETTOKEN');
+
+      for (const call of errorSpy.mock.calls) {
+        for (const arg of call) {
+          expect(String(arg)).not.toContain('SUPERSECRETTOKEN');
+        }
+      }
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });

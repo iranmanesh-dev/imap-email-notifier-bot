@@ -24,6 +24,30 @@ export class FatalTelegramError extends Error {}
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const MAX_BACKOFF_MS = 60_000;
 
+function backoffMs(failures: number): number {
+  return Math.min(2 ** failures * 500, MAX_BACKOFF_MS);
+}
+
+/**
+ * Redacts the bot token from a string before it reaches a log line. The
+ * token is embedded in every request URL, so any error text or log message
+ * that echoes a URL (or an underlying fetch failure, whose message can
+ * include the URL) must be scrubbed at this boundary — the same defensive
+ * move used for IMAP passwords in src/imap/probe.ts.
+ */
+function redact(text: string, token: string): string {
+  if (token.length === 0) return text;
+  return text.split(token).join('***');
+}
+
+function isValidUpdate(value: unknown): value is TelegramUpdate {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    Number.isInteger((value as { update_id?: unknown }).update_id)
+  );
+}
+
 /**
  * Long-polls getUpdates until the signal aborts.
  *
@@ -40,8 +64,12 @@ export async function runReceiver(opts: ReceiverOptions): Promise<void> {
   let offset = 0;
   let failures = 0;
 
+  const logError = (message: string): void => {
+    console.error(redact(message, opts.token));
+  };
+
   const dropWebhook = async (): Promise<void> => {
-    await doFetch(`${base}/deleteWebhook`, { method: 'POST' }).catch(() => undefined);
+    await doFetch(`${base}/deleteWebhook`, { method: 'POST', signal: opts.signal }).catch(() => undefined);
   };
 
   if (opts.signal.aborted) return;
@@ -56,8 +84,8 @@ export async function runReceiver(opts: ReceiverOptions): Promise<void> {
     } catch (err) {
       if (opts.signal.aborted) return;
       failures += 1;
-      console.error(`[telegram] poll failed: ${errorText(err)}`);
-      await sleep(Math.min(2 ** failures * 500, MAX_BACKOFF_MS));
+      logError(`[telegram] poll failed: ${errorText(err)}`);
+      await sleep(backoffMs(failures));
       continue;
     }
 
@@ -68,33 +96,54 @@ export async function runReceiver(opts: ReceiverOptions): Promise<void> {
     }
 
     if (res.status === 409) {
-      // A webhook was registered behind our back; they are mutually exclusive.
-      console.error('[telegram] 409 conflict; removing webhook and resuming');
+      // Telegram allows only one long-poll consumer at a time. The dominant
+      // real cause of 409 here is *another poller* running concurrently —
+      // two container replicas, or a redeploy where the old instance
+      // overlaps the new one — not a stray webhook. deleteWebhook cannot
+      // fix that case, so we still call it (cheap, and does fix the webhook
+      // variant) but always back off too: without a sleep here, two
+      // overlapping pollers spin at full CPU issuing paired requests until
+      // Telegram rate-limits or bans the bot.
+      failures += 1;
+      logError(
+        '[telegram] 409 conflict from getUpdates; this usually means another poller is ' +
+          'running (e.g. a duplicate instance during redeploy), not a stale webhook — ' +
+          'clearing webhook defensively and backing off'
+      );
       await dropWebhook();
+      await sleep(backoffMs(failures));
       continue;
     }
 
     if (!res.ok) {
       failures += 1;
-      await sleep(Math.min(2 ** failures * 500, MAX_BACKOFF_MS));
+      await sleep(backoffMs(failures));
       continue;
     }
 
     failures = 0;
-    const payload = (await res.json().catch(() => ({ result: [] }))) as {
-      result?: TelegramUpdate[];
-    };
-    const updates = payload.result ?? [];
+    const payload = (await res.json().catch(() => ({ result: [] }))) as { result?: unknown };
+    const rawResult = payload.result;
 
-    for (const update of updates) {
+    if (rawResult !== undefined && !Array.isArray(rawResult)) {
+      logError('[telegram] getUpdates returned a non-array result; ignoring this batch');
+    }
+
+    const updates = Array.isArray(rawResult) ? rawResult : [];
+
+    for (const raw of updates) {
+      if (!isValidUpdate(raw)) {
+        logError('[telegram] skipping an update with a missing or invalid update_id');
+        continue;
+      }
       // Advance past this update BEFORE handling it. A handler that throws
       // must not make the same update replay forever — the command handler
       // is responsible for reporting its own failures.
-      offset = Math.max(offset, update.update_id + 1);
+      offset = Math.max(offset, raw.update_id + 1);
       try {
-        await opts.onUpdate(update);
+        await opts.onUpdate(raw);
       } catch (err) {
-        console.error(`[telegram] handler failed: ${errorText(err)}`);
+        logError(`[telegram] handler failed: ${errorText(err)}`);
       }
     }
   }
