@@ -22,7 +22,9 @@ import type { NormalizedEmail } from '../../src/types.js';
 
 const IMAP_HOST = '127.0.0.1';
 const IMAP_PORT = 3143;
-const IMAP = { host: IMAP_HOST, port: IMAP_PORT, secure: false, auth: { user: 'tester', pass: 'testpass' } };
+const IMAP_USER = 'tester';
+const IMAP_PASS = 'testpass';
+const IMAP = { host: IMAP_HOST, port: IMAP_PORT, secure: false, auth: { user: IMAP_USER, pass: IMAP_PASS } };
 const SMTP = { host: '127.0.0.1', port: 3025, secure: false };
 const START_COMMAND = 'docker compose -f test/integration/docker-compose.test.yml up -d';
 
@@ -379,4 +381,43 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(failDeliveries).toHaveLength(1);
     expect(okDeliveries).toHaveLength(1);
   });
+
+  it('starts watching a mailbox added through the store, and stops when removed', async () => {
+    const { MailboxStore } = await import('../../src/store/mailboxes.js');
+    const { deriveKey } = await import('../../src/crypto/secret.js');
+    const { WatcherRegistry } = await import('../../src/imap/registry.js');
+
+    const mbPath = join(dir, 'mailboxes.db');
+    const mb = new MailboxStore(mbPath, deriveKey('k'.repeat(32)));
+    const account = {
+      label: 'Live', host: IMAP_HOST, port: IMAP_PORT,
+      user: IMAP_USER, pass: IMAP_PASS, secure: false,
+    };
+    mb.add(account);
+    expect(mb.get('Live')?.pass).toBe(IMAP_PASS);
+
+    const started: string[] = [];
+    const stopped: string[] = [];
+    const registry = new WatcherRegistry((a) => ({
+      label: a.label,
+      state: 'ok' as const,
+      async start() { started.push(a.label); },
+      async stop() { stopped.push(a.label); },
+    }));
+
+    await registry.add(mb.get('Live')!);
+    expect(started).toEqual(['Live']);
+    expect(registry.has('Live')).toBe(true);
+
+    await registry.remove('Live');
+    mb.remove('Live');
+    store.purgeAccount('Live');
+
+    expect(stopped).toEqual(['Live']);
+    expect(registry.has('Live')).toBe(false);
+    expect(mb.get('Live')).toBeNull();
+    expect(store.getFolderState('Live', 'INBOX')).toBeNull();
+
+    mb.close();
+  }, 60_000);
 });
