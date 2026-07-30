@@ -9,7 +9,8 @@
   "scripts": {
     "test": "vitest run",
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js"
+    "start": "node dist/index.js",
+    "test:integration": "vitest run --config test/integration/vitest.config.ts"
   },
   "keywords": [],
   "author": "",
@@ -28,7 +29,9 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/mailparser": "^3.4.6",
     "@types/node": "^26.1.2",
+    "@types/nodemailer": "^8.0.1",
     "node-gyp": "^13.0.1",
+    "nodemailer": "^9.0.3",
     "typescript": "^7.0.2",
     "vitest": "^4.1.10"
   }
