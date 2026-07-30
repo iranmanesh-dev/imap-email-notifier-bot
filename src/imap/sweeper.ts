@@ -36,7 +36,15 @@ export type SweepResult = {
   failures: { folder: string; message: string }[];
 };
 
-function errorMessage(err: unknown): string {
+/**
+ * Safely stringifies a caught value that may not be an Error. A bare
+ * `(err as Error).message` throws a TypeError when `err` is `null` or
+ * `undefined` (a non-Error rejection reason), and that throw would escape
+ * from inside a catch block meant to be the last line of defense. Exported
+ * so other modules (e.g. watcher.ts) can reuse the same safe formatting
+ * instead of duplicating an unguarded cast.
+ */
+export function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 

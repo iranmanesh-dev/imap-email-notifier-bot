@@ -927,4 +927,74 @@ describe('AccountWatcher', () => {
       vi.useRealTimers();
     }
   });
+
+  // --- Finding 7: watcher.ts used `(err as Error).message` instead of
+  // sweeper.ts's safe errorMessage() helper ---
+  //
+  // A non-Error rejection (e.g. a bare `throw null`) makes that
+  // interpolation throw a TypeError *out of the catch block itself*. In
+  // #connectWithRetry that means the whole retry loop aborts and start()
+  // rejects instead of retrying; in #runSweep it escapes before the
+  // reconnect call is ever reached, silently skipping the reconnect.
+
+  it('does not let a non-Error connection-failure rejection escape as a TypeError, and still retries', async () => {
+    await withStore(async (store) => {
+      let attempts = 0;
+      const connect = vi.fn(async () => {
+        attempts += 1;
+        if (attempts < 2) throw null; // eslint-disable-line no-throw-literal
+      });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { connect, runSweep: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+      });
+
+      // Before the fix, `(null as Error).message` throws a TypeError inside
+      // the catch block, which propagates all the way out of start().
+      await watcher.start();
+
+      expect(connect).toHaveBeenCalledTimes(2);
+      expect(watcher.state).toBe('ok');
+      await watcher.stop();
+    });
+  });
+
+  it('does not let a non-Error sweep-failure rejection escape as a TypeError, and still attempts the reconnect', async () => {
+    await withStore(async (store) => {
+      let sweepCalls = 0;
+      const runSweep = vi.fn(async () => {
+        sweepCalls += 1;
+        if (sweepCalls === 1) throw null; // eslint-disable-line no-throw-literal
+      });
+      let connectCalls = 0;
+      const connect = vi.fn(async () => {
+        connectCalls += 1;
+      });
+
+      const watcher = new AccountWatcher({
+        account,
+        store,
+        previewChars: 200,
+        sweepIntervalSeconds: 3600,
+        onEmail: async () => {},
+        onFatal: async () => {},
+        deps: { connect, runSweep, disconnect: async () => {}, sleep: async () => {} },
+      });
+
+      // start()'s initial sweep throws null. Before the fix, formatting the
+      // log message throws a TypeError that escapes #runSweep entirely,
+      // skipping the reconnect call below it (connectCalls would stay at 1).
+      await watcher.start();
+
+      expect(connectCalls).toBeGreaterThanOrEqual(2); // the reconnect was actually attempted
+      expect(watcher.state).toBe('ok');
+      await watcher.stop();
+    });
+  });
 });

@@ -1,6 +1,6 @@
 import type { ImapFlow } from 'imapflow';
 import { createClient, imapSweepDeps, isAuthError } from './client.js';
-import { sweep } from './sweeper.js';
+import { sweep, errorMessage } from './sweeper.js';
 import type { SeenStore } from '../store/seen.js';
 import type { Account, NormalizedEmail } from '../types.js';
 
@@ -155,7 +155,7 @@ export class AccountWatcher {
 
         this.#consecutiveFailures += 1;
         console.error(
-          `[${this.#opts.account.label}] connection failed: ${(err as Error).message}; retrying`
+          `[${this.#opts.account.label}] connection failed: ${errorMessage(err)}; retrying`
         );
 
         if (this.#consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -225,7 +225,7 @@ export class AccountWatcher {
     // needs this listener just as much as the idle client does. Never logs
     // more than the account label and error message.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] sweep client error: ${(err as Error).message}`);
+      console.error(`[${this.#opts.account.label}] sweep client error: ${errorMessage(err)}`);
     });
     if (this.#stopped) {
       // stop() ran while client.connect() was in flight. stop() has already
@@ -267,7 +267,7 @@ export class AccountWatcher {
     // window between connect() and this listener unprotected would still
     // let a drop in exactly that window crash the process.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] idler error: ${(err as Error).message}`);
+      console.error(`[${this.#opts.account.label}] idler error: ${errorMessage(err)}`);
     });
     if (this.#stopped) {
       // Same race as #connectSweep: stop() ran while we were connecting.
@@ -392,7 +392,7 @@ export class AccountWatcher {
       if (!this.#stopped) this.#state = 'ok';
     } catch (err) {
       if (!this.#stopped) this.#state = 'reconnecting';
-      console.error(`[${this.#opts.account.label}] sweep failed: ${(err as Error).message}`);
+      console.error(`[${this.#opts.account.label}] sweep failed: ${errorMessage(err)}`);
       // Only the sweep client is suspect here; #connectSweep leaves the
       // idle client (and its watchdog) completely alone.
       const reconnected = await this.#connectWithRetry(() => this.#connectSweep());
