@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildHealthReport, startHealthServer } from '../src/health.js';
-import { createEmailHandler, shutdown, startAllWatchers } from '../src/index.js';
+import { createEmailHandler, shutdown, startAllWatchers, armPruneTimer } from '../src/index.js';
 import type { NormalizedEmail } from '../src/types.js';
 import type { SendOutcome } from '../src/telegram/sender.js';
 
@@ -274,6 +274,47 @@ describe('shutdown', () => {
 
     expect(exit).toHaveBeenCalledWith(0);
     expect(exit).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('armPruneTimer', () => {
+  // Finding 6: a bare setInterval's first tick fires only after
+  // intervalMs has elapsed. In a redeploy-heavy Coolify setup, the process
+  // may never survive a full 24h between restarts, so the documented
+  // 30-day prune bound could go unenforced indefinitely. armPruneTimer must
+  // run prune once immediately, then arm the periodic timer.
+
+  it('runs prune immediately, before the first interval tick', () => {
+    vi.useFakeTimers();
+    try {
+      const store = { prune: vi.fn(() => 0) };
+      const timer = armPruneTimer(store, 30, 24 * 60 * 60 * 1000);
+
+      expect(store.prune).toHaveBeenCalledTimes(1);
+      expect(store.prune).toHaveBeenCalledWith(30);
+
+      clearInterval(timer);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('still runs prune again after each interval elapses', () => {
+    vi.useFakeTimers();
+    try {
+      const store = { prune: vi.fn(() => 0) };
+      const timer = armPruneTimer(store, 30, 1000);
+
+      expect(store.prune).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(1000);
+      expect(store.prune).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(1000);
+      expect(store.prune).toHaveBeenCalledTimes(3);
+
+      clearInterval(timer);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

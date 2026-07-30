@@ -176,6 +176,27 @@ export async function shutdown(signal: string, deps: ShutdownDeps): Promise<void
   }
 }
 
+/** Minimal shape `armPruneTimer` needs from a SeenStore, so tests can pass a stub. */
+export type PruneStore = { prune(days: number): number };
+
+/**
+ * Runs an immediate prune, then arms a periodic timer for subsequent runs.
+ * Extracted (mirroring the createEmailHandler/shutdown/startAllWatchers
+ * extractions) after a review finding: a bare `setInterval` only fires its
+ * first tick after `intervalMs` has elapsed. In a redeploy-heavy Coolify
+ * setup, the process may be restarted well before a full 24h passes, so the
+ * documented 30-day retention bound could go unenforced indefinitely.
+ * Running prune once immediately closes that gap.
+ */
+export function armPruneTimer(store: PruneStore, days: number, intervalMs: number): NodeJS.Timeout {
+  const runPrune = (): void => {
+    const removed = store.prune(days);
+    if (removed > 0) safeConsoleLogger.log(`pruned ${removed} seen-message records`);
+  };
+  runPrune();
+  return setInterval(runPrune, intervalMs);
+}
+
 /** Minimal shape `startAllWatchers` needs from an AccountWatcher, so tests can pass a stub. */
 export type StartableWatcher = {
   label: string;
@@ -249,10 +270,7 @@ async function main(): Promise<void> {
     buildHealthReport(watchers.map((w) => ({ label: w.label, state: w.state })))
   );
 
-  const pruneTimer = setInterval(() => {
-    const removed = store.prune(PRUNE_AFTER_DAYS);
-    if (removed > 0) safeConsoleLogger.log(`pruned ${removed} seen-message records`);
-  }, PRUNE_INTERVAL_MS);
+  const pruneTimer = armPruneTimer(store, PRUNE_AFTER_DAYS, PRUNE_INTERVAL_MS);
 
   safeConsoleLogger.log(`watching ${watchers.length} mailbox(es); health on :${config.healthPort}`);
 
