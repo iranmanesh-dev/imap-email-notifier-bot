@@ -168,6 +168,10 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     const run = collector();
     const result = await sweep(deps, run.opts);
     expect(result.failures).toEqual([]);
+    // Isolation-safe: failures is asserted empty above, so this only requires
+    // INBOX itself (always present on any mailbox, never created by another
+    // test) to have been swept successfully — it does not depend on any
+    // other test having created an extra mailbox.
     expect(result.foldersChecked).toBeGreaterThan(0);
 
     const delivered = run.received.filter((e) => e.messageId === id);
@@ -203,6 +207,9 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(result.failures).toEqual([]);
     // Guards against this passing vacuously: with zero folders returned by
     // deps.list(), there would trivially be no fetch and no notification too.
+    // Isolation-safe for the same reason as the previous test: failures is
+    // empty, so this only requires INBOX itself to have succeeded, not any
+    // mailbox created by another test.
     expect(result.foldersChecked).toBeGreaterThan(0);
     fetchSpy.mockRestore();
   });
@@ -339,10 +346,17 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(firstResult.failures.length).toBeGreaterThan(0);
     expect(delivered.map((e) => e.messageId)).toContain(okId);
     expect(delivered.map((e) => e.messageId)).not.toContain(failId);
-    // The INBOX folder itself failed (that's the point of this test), but
-    // foldersChecked must still reflect that other folders were genuinely
-    // swept, not that deps.list() returned nothing.
-    expect(firstResult.foldersChecked).toBeGreaterThan(0);
+    // INBOX itself is the folder that fails here — that's the point of this
+    // test — so `foldersChecked` (which only counts successes) is 0 for a
+    // mailbox where INBOX is the only folder, and asserting it's >0 would
+    // make this test depend on some other test having created an extra
+    // (successfully-swept) mailbox like Archive first. Assert what's actually
+    // true instead: the failure names INBOX (proving it was listed, selected,
+    // and genuinely attempted), and the total attempted — checked plus
+    // failed — is non-zero, which is the real anti-vacuity guard for a sweep
+    // whose only folder is expected to fail.
+    expect(firstResult.failures).toContainEqual(expect.objectContaining({ folder: 'INBOX' }));
+    expect(firstResult.foldersChecked + firstResult.failures.length).toBeGreaterThan(0);
 
     const secondAttempt = {
       accountLabel: 'Retry',
@@ -354,6 +368,9 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     };
     const secondResult = await sweep(deps, secondAttempt);
     expect(secondResult.failures).toEqual([]);
+    // Isolation-safe: failures is empty here (every folder succeeds on this
+    // retry sweep), so this only requires INBOX itself to have succeeded,
+    // not any mailbox created by another test.
     expect(secondResult.foldersChecked).toBeGreaterThan(0);
 
     // failId is now delivered, exactly once overall; okId was not re-sent.
