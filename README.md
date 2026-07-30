@@ -49,10 +49,27 @@ The full design rationale, including the failure modes each decision guards agai
 2. **Find your chat ID.** Send any message to your new bot, then open
    `https://api.telegram.org/bot<TOKEN>/getUpdates` and read
    `result[0].message.chat.id`.
-3. **Copy `.env.example` to `.env`** and fill in the token, chat ID, and a `MASTER_KEY`
-   (`openssl rand -base64 32`). There is no `MAILBOXES` variable — mailboxes are added at
-   runtime by messaging the bot (see [Adding a mailbox](#adding-a-mailbox) below), and a
-   fresh install legitimately starts with zero mailboxes configured.
+3. **Create a `.env` file** next to `docker-compose.yml` with exactly these three
+   variables:
+
+   ```bash
+   TELEGRAM_BOT_TOKEN=<the token BotFather gave you>
+   TELEGRAM_CHAT_ID=<the chat id from step 2>
+   MASTER_KEY=<a fresh secret, at least 32 characters>
+   ```
+
+   Generate `MASTER_KEY` with `openssl rand -base64 32`. Every other variable in
+   [Configuration](#configuration) is optional and has a working default.
+
+   There is no `MAILBOXES` variable — mailboxes are added at runtime by messaging the
+   bot (see [Adding a mailbox](#adding-a-mailbox) below), and a fresh install
+   legitimately starts with zero mailboxes configured.
+
+   > **Note:** the `.env.example` file in this repository is out of date. It still lists a
+   > `MAILBOXES` variable, which has been removed and is ignored, and it does not mention
+   > `MASTER_KEY`, which is required. Use the three variables above rather than copying
+   > that file — copying it verbatim fails at boot with
+   > `fatal: Missing required environment variable MASTER_KEY`.
 
 ## Run locally
 
