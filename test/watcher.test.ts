@@ -865,4 +865,66 @@ describe('AccountWatcher', () => {
       await watcher.stop();
     });
   });
+
+  // --- Finding 4: the idle-watchdog reconnect must go through
+  // #connectWithRetry, not call #connectIdle() directly ---
+  //
+  // Only #connectWithRetry classifies auth errors and counts consecutive
+  // failures. Calling #connectIdle() directly from the watchdog meant an
+  // idle reconnect loop (e.g. rotated credentials that the sweep client
+  // never notices, because most IMAP servers keep an already-authenticated
+  // session valid) was both uncapped and unclassified: the account would
+  // never go terminal, and the watchdog would keep issuing a fresh failing
+  // LOGIN every IDLE_REFRESH_MS forever -- exactly the provider-IP-block
+  // scenario MAX_CONSECUTIVE_FAILURES exists to prevent.
+
+  it('routes idle-watchdog reconnects through #connectWithRetry, so repeated failures trip the cap and drive the account terminal', async () => {
+    vi.useFakeTimers();
+    try {
+      await withStore(async (store) => {
+        // The initial connect constructs exactly two clients (sweep, idle).
+        // Every client constructed after that is an idle-watchdog reconnect
+        // attempt in this test (no sweep reconnect is ever triggered), so
+        // failing every connect from the third construction onward isolates
+        // the idle-only reconnect path.
+        const { factory, records } = createTrackedClientFactory({
+          failConnect: () => factory.mock.calls.length >= 3,
+        });
+        const onFatal = vi.fn(async () => {});
+
+        const watcher = new AccountWatcher({
+          account,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal,
+          deps: { createClientImpl: factory, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        expect(watcher.state).toBe('ok');
+
+        const idleRecord = records[1]!;
+        idleRecord.usable = false; // force the stale-idler reconnect branch
+
+        await vi.advanceTimersByTimeAsync(9 * 60_000); // one IDLE_REFRESH_MS tick
+
+        // Before the fix, #checkIdleHealth called #connectIdle() directly:
+        // it would log one reconnect failure and quietly wait for the next
+        // tick forever, never reaching connect-failed and never calling
+        // onFatal.
+        expect(watcher.state).toBe('connect-failed');
+        expect(onFatal).toHaveBeenCalledTimes(1);
+
+        const factoryCallsAtTerminal = factory.mock.calls.length;
+        await vi.advanceTimersByTimeAsync(9 * 60_000);
+        expect(factory.mock.calls.length).toBe(factoryCallsAtTerminal); // watchdog fully stopped
+
+        await watcher.stop();
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

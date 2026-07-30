@@ -333,13 +333,12 @@ export class AccountWatcher {
       }
 
       console.error(`[${this.#opts.account.label}] idler stale; reconnecting it`);
-      try {
-        await this.#connectIdle();
-      } catch (err) {
-        console.error(
-          `[${this.#opts.account.label}] idler reconnect failed: ${(err as Error).message}`
-        );
-      }
+      // Routed through #connectWithRetry (not called directly) so this
+      // reconnect is classified and counted exactly like any other
+      // connection attempt: isAuthError gets a chance to fire, and repeated
+      // failures count toward MAX_CONSECUTIVE_FAILURES instead of retrying
+      // forever, uncapped and unclassified, once every IDLE_REFRESH_MS.
+      await this.#connectWithRetry(() => this.#connectIdle());
     } finally {
       this.#idleHealthInFlight = false;
     }
