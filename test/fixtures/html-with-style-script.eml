@@ -1,0 +1,8 @@
+From: Newsletter <news@example.com>
+To: me@example.com
+Subject: Styled newsletter
+Message-ID: <html-style-001@example.com>
+Date: Tue, 28 Jul 2026 17:00:00 +0000
+Content-Type: text/html; charset=utf-8
+
+<html><head><style>body { color: red; }</style></head><body><script>alert('x');</script><h1>Important update</h1><p>Please read this.</p></body></html>

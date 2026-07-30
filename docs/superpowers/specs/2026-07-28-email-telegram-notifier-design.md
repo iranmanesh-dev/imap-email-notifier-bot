@@ -14,6 +14,11 @@ short body preview.
 1. A message arriving in INBOX produces a Telegram notification within ~5 seconds.
 2. A message arriving in any other folder produces one within ~60 seconds.
 3. No email produces two notifications, including when it is moved between folders.
+   **Amended during implementation by explicit user decision:** deduplication is scoped
+   *per account*. The same email arriving in two configured mailboxes notifies twice —
+   once per mailbox, each labelled with its own account. Within a single account it still
+   notifies exactly once, including across folder moves. Two known, accepted exceptions
+   are documented under "Deduplication" below.
 4. First boot against a mailbox notifies nothing; only mail arriving after startup is sent.
 5. A dropped IMAP connection delays notifications but never loses them.
 6. The container survives restarts, redeploys, and mail-server outages without manual work.
@@ -121,15 +126,37 @@ push the entire mailbox history to Telegram.
 
 ### Deduplication
 
-Every notified `Message-ID` is stored in SQLite and checked before sending. This is what
-makes "watch every folder" usable: a message moved from INBOX to Archive appears as a new
-arrival in Archive, and dedup suppresses the second notification. It also guarantees that
-a restart, a redeploy, or an overlapping idler/sweeper detection never re-notifies.
+Every notified message is recorded in SQLite as `(accountLabel, messageId)` and checked
+before sending. This is what makes "watch every folder" usable: a message moved from INBOX
+to Archive appears as a new arrival in Archive, and dedup suppresses the second
+notification. It also guarantees that a restart, a redeploy, or an overlapping
+idler/sweeper detection never re-notifies.
+
+The key is scoped by account (user decision, see success criterion 3), so each mailbox that
+genuinely receives an email gets its own labelled notification. Without this the winning
+mailbox was decided by whichever account's sweep ran first, making the account label on the
+notification arbitrary.
 
 Messages lacking a `Message-ID` header fall back to a synthetic key of
-`sha256(account + from + subject + date)`.
+`sha256(accountLabel + raw RFC822 source)`. Deriving it from the raw bytes rather than
+header fields keeps it stable across re-reads; wall-clock time is deliberately excluded,
+because an earlier version folded in `new Date()` and produced a different key on every
+read, re-notifying forever.
 
-Entries are pruned after 30 days to bound database growth.
+Entries are pruned after 30 days to bound database growth. Prune runs once at startup and
+then every 24 hours, so a redeploy-heavy environment still enforces the bound.
+
+**Two accepted exceptions to "exactly once":**
+
+1. **At-least-once on crash.** `markSeen` is called only *after* a successful send, so a
+   process kill between the two yields one duplicate on restart. This is deliberate: the
+   alternative ordering silently *loses* the email whenever a send fails, which is strictly
+   worse.
+2. **Message-ID-less mail moved between folders.** The synthetic key hashes the raw source,
+   which some IMAP servers alter between fetches (header refolding, added `X-` headers), so
+   such a message can be re-notified. Affects only mail with no `Message-ID` header. The
+   alternative — hashing selected header fields — would let two genuinely distinct messages
+   collide and be silently suppressed, trading a duplicate for a loss.
 
 ### Message format
 
@@ -185,11 +212,21 @@ zod at boot; invalid config fails immediately and loudly rather than at the firs
 
 ## Deployment
 
-- Multi-stage `node:22-alpine` build, running as a non-root user.
+- Multi-stage **`node:22-bookworm-slim`** build (not alpine — `better-sqlite3` ships
+  prebuilt binaries for glibc only, so musl would force a full C++ toolchain into the
+  image anyway), running as a non-root user. The build compiles the native binding from
+  source and fails the build if it does not load, because the bundled prebuild requires a
+  newer glibc than bookworm ships and would otherwise produce a silently broken image.
 - SQLite in WAL mode at `DB_PATH`, backed by a Coolify persistent volume mounted at `/data`.
 - `restart: unless-stopped`.
-- Coolify healthcheck against `/healthz`, which reports each account's connection state so
-  a wedged container is restarted automatically.
+- Coolify healthcheck against `/healthz`. **The check is liveness-only: any HTTP response
+  means alive.** It deliberately does NOT fail on a degraded account, because every
+  degraded state is one a restart makes worse — a restart resets the reconnect backoff,
+  retries an unchanged wrong password, and zeroes the consecutive-failure cap, turning a
+  bounded 20-attempt limit into an unbounded loop across restarts. No failure exists that a
+  restart fixes but a "did it respond at all" check misses, since a wedged process fails to
+  respond anyway. Degraded state is surfaced through the `/healthz` response body, the
+  `onFatal` Telegram alert, and stderr.
 - Secrets supplied as Coolify environment variables. `.env` is git-ignored and never committed.
 
 ## Security

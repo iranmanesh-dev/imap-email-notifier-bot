@@ -1,0 +1,10 @@
+node_modules
+dist
+.git
+.env
+data
+test
+docs
+.superpowers
+.claude-flow
+*.db

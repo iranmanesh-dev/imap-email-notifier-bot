@@ -1,0 +1,8 @@
+From: Newsletter <news@example.com>
+To: me@example.com
+Subject: Your weekly digest
+Message-ID: <html-001@example.com>
+Date: Tue, 28 Jul 2026 11:00:00 +0000
+Content-Type: text/html; charset=utf-8
+
+<html><body><h1>Weekly digest</h1><p>Three new items this week.</p></body></html>

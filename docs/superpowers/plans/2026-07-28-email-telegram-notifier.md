@@ -628,7 +628,7 @@ function collapse(text: string): string {
 }
 
 function syntheticId(parts: string[]): string {
-  const hash = createHash('sha256').update(parts.join(' ')).digest('hex');
+  const hash = createHash('sha256').update(parts.join('|')).digest('hex');
   return `synthetic:${hash}`;
 }
 
@@ -689,7 +689,7 @@ Two responsibilities that share one database file: `Message-ID` deduplication, a
   - `class SeenStore` with:
     - `constructor(dbPath: string)`
     - `hasSeen(messageId: string): boolean`
-    - `markSeen(messageId: string): boolean` — returns `true` if newly inserted, `false` if already present
+    - `markSeen(messageId: string, firstSeenAt?: string): boolean` — returns `true` if newly inserted, `false` if already present. `firstSeenAt` is an optional SQLite datetime string; it exists so tests can create backdated rows without reaching into the database.
     - `getFolderState(accountLabel: string, folder: string): FolderState | null`
     - `setFolderState(accountLabel: string, folder: string, state: FolderState): void`
     - `prune(olderThanDays: number): number` — returns rows deleted
@@ -777,15 +777,21 @@ describe('prune', () => {
     expect(store.hasSeen('<a@x>')).toBe(true);
   });
 
-  it('deletes entries older than the cutoff', () => {
-    store.markSeen('<old@x>');
-    // Backdate the row by 40 days.
-    store.rawForTests().prepare(
-      "UPDATE seen SET first_seen_at = datetime('now', '-40 days') WHERE message_id = ?"
-    ).run('<old@x>');
+  /** SQLite datetime string (`YYYY-MM-DD HH:MM:SS`) for N days before now. */
+  function daysAgo(days: number): string {
+    return new Date(Date.now() - days * 86_400_000).toISOString().replace('T', ' ').slice(0, 19);
+  }
 
+  it('deletes entries older than the cutoff', () => {
+    store.markSeen('<old@x>', daysAgo(40));
     expect(store.prune(30)).toBe(1);
     expect(store.hasSeen('<old@x>')).toBe(false);
+  });
+
+  it('keeps entries just inside the cutoff', () => {
+    store.markSeen('<recent@x>', daysAgo(29));
+    expect(store.prune(30)).toBe(0);
+    expect(store.hasSeen('<recent@x>')).toBe(true);
   });
 });
 ```
@@ -835,10 +841,18 @@ export class SeenStore {
     return row !== undefined;
   }
 
-  markSeen(messageId: string): boolean {
-    const info = this.#db
-      .prepare('INSERT OR IGNORE INTO seen (message_id) VALUES (?)')
-      .run(messageId);
+  /**
+   * Records a message id as notified. Returns true if it was newly inserted.
+   * `firstSeenAt` (a bound `YYYY-MM-DD HH:MM:SS` value) lets tests create
+   * backdated rows; production callers omit it.
+   */
+  markSeen(messageId: string, firstSeenAt?: string): boolean {
+    const info =
+      firstSeenAt === undefined
+        ? this.#db.prepare('INSERT OR IGNORE INTO seen (message_id) VALUES (?)').run(messageId)
+        : this.#db
+            .prepare('INSERT OR IGNORE INTO seen (message_id, first_seen_at) VALUES (?, ?)')
+            .run(messageId, firstSeenAt);
     return info.changes > 0;
   }
 
@@ -869,11 +883,6 @@ export class SeenStore {
     return info.changes;
   }
 
-  /** Escape hatch for tests that need to backdate rows. Not for production use. */
-  rawForTests(): Database.Database {
-    return this.#db;
-  }
-
   close(): void {
     this.#db.close();
   }
@@ -883,7 +892,7 @@ export class SeenStore {
 - [ ] **Step 4: Run the test to verify it passes**
 
 Run: `npx vitest run test/seen.test.ts`
-Expected: PASS, 10 tests.
+Expected: PASS, 11 tests.
 
 - [ ] **Step 5: Commit**
 
@@ -1217,7 +1226,13 @@ The heart of the design. Lists folders, checks `UIDNEXT` and `UIDVALIDITY` via `
 - Produces:
   - `type SweepDeps = { list(): Promise<{ path: string }[]>; status(path: string): Promise<{ uidNext: number; uidValidity: number }>; fetchSince(path: string, uidFrom: number): Promise<{ uid: number; source: Buffer }[]> }`
   - `type SweepOptions = { accountLabel: string; previewChars: number; store: SeenStore; onEmail: (email: NormalizedEmail) => Promise<void> }`
-  - `function sweep(deps: SweepDeps, opts: SweepOptions): Promise<void>`
+  - `type SweepResult = { foldersChecked: number; failures: { folder: string; message: string }[] }` — `foldersChecked` counts SUCCESSFULLY swept folders only, excluding `failures`
+  - `function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult>`
+
+> **Corrected during execution.** Two defects in this task's originally-written code were found in review and fixed; the shipped `src/imap/sweeper.ts` is authoritative where it differs from the snippets below.
+> 1. **Ordering (Critical).** The original gated notification on `markSeen`, which marked the id *before* `onEmail`. A failed send then held folder state for a retry that skipped the already-marked message — losing it permanently. Shipped code gates on `hasSeen` and calls `markSeen` only after `onEmail` resolves. This makes delivery **at-least-once**: a SIGKILL between send and mark yields one duplicate on restart. That is the accepted trade — a duplicate is acceptable, a silent loss is not.
+> 2. **Backward `uidNext` (Important).** The original `current.uidNext <= previous.uidNext` early return kept a stale high-water mark, silently dropping all future mail in a folder whose `UIDNEXT` moved backward without a `UIDVALIDITY` change. Shipped code re-baselines on `<` and no-ops on `==`.
+> 3. **Error signalling (Important).** `sweep` returned `void` and swallowed per-folder errors, so a caller could not tell that every folder had failed. It now returns `SweepResult`. Errors from `deps.list()` still propagate — that is the dead-connection signal.
 
 `SweepDeps` is a narrow interface over ImapFlow rather than ImapFlow itself, so this module is testable with a fake and Task 8 supplies the real adapter.
 
@@ -1465,15 +1480,18 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
       previewChars: opts.previewChars,
     });
 
-    if (!opts.store.markSeen(email.messageId)) continue; // already notified elsewhere
+    // Gate on hasSeen and mark only AFTER a successful send, so a failed send
+    // retries instead of being skipped as already-seen. At-least-once by design.
+    if (opts.store.hasSeen(email.messageId)) continue; // already notified elsewhere
     await opts.onEmail(email);
+    opts.store.markSeen(email.messageId);
   }
 
   // Only advance once the whole batch is handled, so a crash mid-batch retries.
   opts.store.setFolderState(opts.accountLabel, path, current);
 }
 
-export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<void> {
+export async function sweep(deps: SweepDeps, opts: SweepOptions): Promise<SweepResult> {
   const folders = await deps.list();
 
   for (const folder of folders) {
@@ -1536,9 +1554,11 @@ const account: Account = {
 };
 
 describe('createClient', () => {
-  it('builds a client for the account host and port', () => {
+  it('returns a client exposing every ImapFlow method this codebase relies on', () => {
     const client = createClient(account);
-    expect(client).toBeDefined();
+    for (const method of ['connect', 'list', 'status', 'getMailboxLock', 'fetch', 'mailboxOpen', 'noop', 'logout']) {
+      expect(typeof (client as unknown as Record<string, unknown>)[method]).toBe('function');
+    }
   });
 });
 
