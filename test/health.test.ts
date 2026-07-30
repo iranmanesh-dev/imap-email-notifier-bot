@@ -38,6 +38,21 @@ describe('buildHealthReport', () => {
     expect(buildHealthReport([{ label: 'Work', state: 'connect-failed' }]).status).toBe('degraded');
   });
 
+  it('reports ok while a mailbox is still starting up (initialising is not degraded)', () => {
+    // The registry now surfaces in-flight adds as 'starting'. Without this,
+    // a container that just booted with several mailboxes still connecting
+    // would answer 503 for its entire startup window.
+    const report = buildHealthReport([
+      { label: 'Work', state: 'ok' },
+      { label: 'Personal', state: 'starting' },
+    ]);
+    expect(report.status).toBe('ok');
+  });
+
+  it('still reports degraded once a starting mailbox begins failing', () => {
+    expect(buildHealthReport([{ label: 'Work', state: 'reconnecting' }]).status).toBe('degraded');
+  });
+
   it('reports ok when no mailboxes are configured yet (idle, not unhealthy)', () => {
     const report = buildHealthReport([]);
     expect(report.status).toBe('ok');

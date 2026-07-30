@@ -223,7 +223,10 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
   // in-flight sweep (bounded) before resolving, which is what stops that
   // sweep's trailing setFolderState from landing after the purge below and
   // resurrecting the stale high-water mark.
-  await deps.registry.remove(label);
+  // The boolean distinguishes "stopped a running (or still-starting)
+  // watcher" from "there was nothing to stop", so the confirmation below
+  // can be truthful. Either way the credentials and history still go.
+  const wasWatched = await deps.registry.remove(label);
 
   try {
     deps.mailboxes.remove(label);
@@ -244,7 +247,11 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
     );
   }
 
-  return deps.reply(`Removed "${label}" and stopped watching it.`);
+  return deps.reply(
+    wasWatched
+      ? `Removed "${label}" and stopped watching it.`
+      : `Removed "${label}". It was not being watched, so there was nothing to stop.`
+  );
 }
 
 /**

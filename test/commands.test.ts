@@ -295,6 +295,21 @@ describe('/remove', () => {
   // that production path did not exist. See completeRemove for why reporting
   // a stop failure would be the wrong behaviour anyway.
 
+  it('does not claim to have stopped a watcher when none was running, but still removes the credentials', async () => {
+    const { deps, replies, stored } = makeDeps();
+    // Saved but never watched — e.g. skipped during the startup restore.
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleUpdate(msg('/remove Work'), deps);
+    await handleUpdate(msg('yes'), deps);
+
+    expect(stored.size).toBe(0); // credentials still removed
+    expect(deps.seen.purgeAccount).toHaveBeenCalledWith('Work');
+    expect(replies.at(-1)).toMatch(/removed/i);
+    expect(replies.at(-1)).toMatch(/not being watched|nothing to stop/i);
+    expect(replies.at(-1)).not.toMatch(/and stopped watching it/i);
+  });
+
   it('purges the seen-state only after the watcher has been stopped, never before', async () => {
     // Ordering regression: completeRemove must not purge while the watcher
     // could still be writing. The registry stub records the order so a

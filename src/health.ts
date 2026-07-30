@@ -8,19 +8,29 @@ export type HealthReport = {
 };
 
 /**
- * Any state other than 'ok' is treated as degraded. This is deliberately
- * generic rather than an allowlist of specific bad states: it also covers
- * 'connect-failed' (the terminal state after exhausting the bounded
- * reconnect cap) without needing to be updated every time a new terminal
- * state is added to WatcherState.
+ * Healthy states are listed explicitly and everything else is degraded —
+ * still deliberately "deny by default", so a new terminal state added to
+ * WatcherState (as 'connect-failed' once was) counts as degraded without
+ * anyone having to remember to update this.
+ *
+ * 'starting' is healthy because it means initialising, not broken. The
+ * registry now reports mailboxes whose add is still in flight (so a mailbox
+ * stuck in a long reconnect is visible to /status and to shutdown), and a
+ * container that has just booted with several mailboxes still connecting
+ * must not report itself degraded for the whole startup window. This does
+ * not hide a real failure: the first failed attempt moves the watcher to
+ * 'reconnecting', and exhausting the cap moves it to 'connect-failed' —
+ * both degraded.
  *
  * Zero watchers is the normal state of a fresh install: mailboxes are
  * added at runtime via Telegram, so an empty set is idle, not unhealthy.
  */
+const HEALTHY_STATES: ReadonlySet<WatcherState> = new Set<WatcherState>(['ok', 'starting']);
+
 export function buildHealthReport(
   watchers: { label: string; state: WatcherState }[]
 ): HealthReport {
-  const healthy = watchers.every((w) => w.state === 'ok');
+  const healthy = watchers.every((w) => HEALTHY_STATES.has(w.state));
   return {
     status: healthy ? 'ok' : 'degraded',
     accounts: watchers.map((w) => ({ label: w.label, state: w.state })),

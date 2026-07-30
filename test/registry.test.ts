@@ -51,20 +51,27 @@ describe('WatcherRegistry', () => {
   });
 
   it('does not leave a registration behind when start() fails', async () => {
-    let startedWithRegistration = false;
+    let registeredDuringStart = true;
+    let visibleDuringStart = false;
     const reg = new WatcherRegistry(() => ({
       label: 'Work',
       state: 'starting' as WatcherState,
       async start() {
-        // Assert that the registry does not already contain this label at start time
-        startedWithRegistration = reg.has('Work');
+        // Registration must not happen until start() succeeds. size() counts
+        // only fully-registered watchers, which is the precise claim here —
+        // has() deliberately also reports in-flight adds now (R1), so it is
+        // no longer the right probe for "not yet registered".
+        registeredDuringStart = reg.size() > 0;
+        visibleDuringStart = reg.has('Work');
         throw new Error('connect failed');
       },
       async stop() {},
     }));
     await expect(reg.add(account)).rejects.toThrow(/connect failed/);
-    expect(startedWithRegistration).toBe(false); // Verify it was not registered before start
-    expect(reg.has('Work')).toBe(false);
+    expect(registeredDuringStart).toBe(false); // not registered before start succeeded
+    expect(visibleDuringStart).toBe(true); // but not invisible either, while in flight
+    expect(reg.has('Work')).toBe(false); // and gone once the failed add unwound
+    expect(reg.size()).toBe(0);
   });
 
   it('still deregisters when stop() throws', async () => {
@@ -151,6 +158,102 @@ describe('WatcherRegistry', () => {
     // Now a new add should succeed (proving in-flight was cleared from the failed attempt)
     await reg.add(account);
     expect(reg.has('Work')).toBe(true);
+  });
+
+  // --- Re-review R1: /remove during an in-flight add left an unremovable
+  // zombie watcher ---
+  //
+  // add() registers only AFTER start() resolves, and in-flight labels lived
+  // in a set that remove(), has() and states() never consulted. Once the
+  // mailbox restore was detached (finding 1), the receiver is live for the
+  // whole retry window — up to ~58 minutes for an unreachable mailbox, which
+  // is exactly when an operator reaches for /remove. The sequence was:
+  // remove() found nothing registered and returned false; the credentials
+  // and seen-state were deleted anyway; then the still-running add()
+  // registered a watcher for a mailbox that no longer existed. It kept
+  // delivering and re-writing seen-state, /list no longer showed it, and
+  // startRemove rejected with "No mailbox labelled" — no way to stop it
+  // short of a container restart.
+
+  /** A watcher whose start() parks until released, so an add stays in flight. */
+  function gatedWatcher(label: string) {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const w = {
+      label,
+      state: 'starting' as WatcherState,
+      started: 0,
+      stopped: 0,
+      async start() {
+        this.started += 1;
+        await gate;
+      },
+      async stop() {
+        this.stopped += 1;
+        release(); // a real stop() unblocks its own start(): #stopped ends the retry loop
+      },
+      release: () => release(),
+    };
+    return w;
+  }
+
+  /** Lets any already-queued microtasks run, without touching timers. */
+  async function flush(times = 10): Promise<void> {
+    for (let i = 0; i < times; i += 1) await Promise.resolve();
+  }
+
+  it('remove() of an in-flight add returns true, stops the watcher, and never registers it', async () => {
+    const w = gatedWatcher('Work');
+    const reg = new WatcherRegistry(() => w);
+
+    const adding = reg.add(account);
+    await flush();
+    expect(w.started).toBe(1); // start() is in flight, nothing registered yet
+
+    // The operator removes it mid-retry. This must not report "nothing to do".
+    expect(await reg.remove('Work')).toBe(true);
+    // Stopped as part of remove() resolving, so a purgeAccount that follows
+    // cannot be written back over by the still-starting watcher.
+    expect(w.stopped).toBe(1);
+
+    await adding; // the add unwinds
+
+    expect(reg.has('Work')).toBe(false);
+    expect(reg.size()).toBe(0);
+    expect(reg.states()).toEqual([]);
+  });
+
+  it('has() and states() report a label whose add is still in flight', async () => {
+    const w = gatedWatcher('Work');
+    const reg = new WatcherRegistry(() => w);
+
+    const adding = reg.add(account);
+    await flush();
+
+    expect(reg.has('Work')).toBe(true);
+    expect(reg.states()).toEqual([{ label: 'Work', state: 'starting' }]);
+
+    w.release();
+    await adding;
+    expect(reg.states()).toEqual([{ label: 'Work', state: 'starting' }]);
+    expect(reg.size()).toBe(1);
+  });
+
+  it('stopAll() cancels an in-flight add, so shutdown cannot be outrun by one', async () => {
+    const w = gatedWatcher('Work');
+    const reg = new WatcherRegistry(() => w);
+
+    const adding = reg.add(account);
+    await flush();
+
+    await reg.stopAll();
+    await adding;
+
+    expect(w.stopped).toBe(1);
+    expect(reg.size()).toBe(0); // never registered behind shutdown's back
+    expect(reg.has('Work')).toBe(false);
   });
 
   it('a failed start() clears the in-flight entry so retry works', async () => {
