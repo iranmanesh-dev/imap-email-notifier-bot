@@ -41,6 +41,14 @@ function truncateCodePoints(text: string, maxChars: number): string {
 // any field-boundary ambiguity: the two inputs are hashed as fixed-length
 // prefixed segments so no choice of accountLabel or message bytes can shift
 // a boundary and produce a collision.
+//
+// Folding accountLabel into this id is no longer an inconsistency with the
+// real-Message-ID path: SeenStore now scopes dedup by (accountLabel,
+// messageId) uniformly, so a synthetic id that is already account-scoped
+// here is redundant-but-harmless rather than the odd one out — a real
+// Message-ID is account-independent on its own, and the store's composite
+// key is what makes both cases behave the same way (one notification per
+// mailbox that genuinely received the message).
 function syntheticId(source: Buffer, accountLabel: string): string {
   const labelBuf = Buffer.from(accountLabel, 'utf8');
   const lengthPrefix = Buffer.alloc(4);

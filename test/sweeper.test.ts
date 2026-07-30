@@ -54,8 +54,8 @@ function makeDeps(folders: Record<string, FakeFolder>) {
   return { deps, fetchCalls };
 }
 
-function makeOpts(onEmail: (e: NormalizedEmail) => Promise<void>) {
-  return { accountLabel: 'Work', previewChars: 200, store, onEmail };
+function makeOpts(onEmail: (e: NormalizedEmail) => Promise<void>, accountLabel = 'Work') {
+  return { accountLabel, previewChars: 200, store, onEmail };
 }
 
 describe('sweep', () => {
@@ -267,5 +267,55 @@ describe('sweep', () => {
 
     expect(fetchCalls).toHaveLength(1);
     expect(fetchCalls[0]!.uidFrom).toBe(10);
+  });
+
+  it('notifies once per account when the same Message-ID reaches two different accounts (dedup is scoped per account, not global)', async () => {
+    const workFolders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const personalFolders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps: workDeps } = makeDeps(workFolders);
+    const { deps: personalDeps } = makeDeps(personalFolders);
+    const onEmail = vi.fn(async () => {});
+
+    // Baseline both accounts first.
+    await sweep(workDeps, makeOpts(onEmail, 'Work'));
+    await sweep(personalDeps, makeOpts(onEmail, 'Personal'));
+
+    // The identical message (same Message-ID) genuinely arrives in both
+    // mailboxes — e.g. it was BCC'd to both, or forwarded.
+    workFolders.INBOX.uidNext = 11;
+    workFolders.INBOX.messages = [{ uid: 10, source: eml('shared', 'Shared message') }];
+    personalFolders.INBOX.uidNext = 11;
+    personalFolders.INBOX.messages = [{ uid: 10, source: eml('shared', 'Shared message') }];
+
+    await sweep(workDeps, makeOpts(onEmail, 'Work'));
+    await sweep(personalDeps, makeOpts(onEmail, 'Personal'));
+
+    // One notification per mailbox that actually received it, not one total.
+    expect(onEmail).toHaveBeenCalledTimes(2);
+  });
+
+  it('still notifies only once when the same Message-ID appears twice under the same account (e.g. moved between folders)', async () => {
+    const folders = {
+      INBOX: { uidNext: 10, uidValidity: 1, messages: [] as { uid: number; source: Buffer }[] },
+      Archive: { uidNext: 5, uidValidity: 2, messages: [] as { uid: number; source: Buffer }[] },
+    };
+    const { deps } = makeDeps(folders);
+    const onEmail = vi.fn(async () => {});
+
+    await sweep(deps, makeOpts(onEmail, 'Work'));
+
+    folders.INBOX.uidNext = 11;
+    folders.INBOX.messages = [{ uid: 10, source: eml('same-account', 'Same account twice') }];
+    await sweep(deps, makeOpts(onEmail, 'Work'));
+
+    folders.Archive.uidNext = 6;
+    folders.Archive.messages = [{ uid: 5, source: eml('same-account', 'Same account twice') }];
+    await sweep(deps, makeOpts(onEmail, 'Work'));
+
+    expect(onEmail).toHaveBeenCalledTimes(1);
   });
 });

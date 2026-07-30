@@ -57,7 +57,10 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
   // fetchSince uses previous.uidNext only as a floor. A message that arrives
   // between status() and fetchSince() may be included here and again in the
   // next sweep's fetch; that overlap is intentional and harmless because
-  // hasSeen/markSeen dedup on messageId, so it is never notified twice.
+  // hasSeen/markSeen dedup on (accountLabel, messageId), so it is never
+  // notified twice for the same account (moving between folders within one
+  // account is still a single notification), while the same message
+  // genuinely reaching a different account's mailbox still notifies there.
   const messages = await deps.fetchSince(path, previous.uidNext);
   messages.sort((a, b) => a.uid - b.uid);
 
@@ -68,7 +71,7 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
       previewChars: opts.previewChars,
     });
 
-    if (opts.store.hasSeen(email.messageId)) continue; // already notified elsewhere
+    if (opts.store.hasSeen(opts.accountLabel, email.messageId)) continue; // already notified for this account
 
     // Mark seen only after the send succeeds. This accepts at-least-once
     // delivery (a crash between onEmail resolving and markSeen committing
@@ -76,7 +79,7 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
     // notification: if onEmail throws, the id stays unmarked and folder
     // state stays unadvanced, so this exact message is retried next sweep.
     await opts.onEmail(email);
-    opts.store.markSeen(email.messageId);
+    opts.store.markSeen(opts.accountLabel, email.messageId);
   }
 
   // Only advance once the whole batch is handled, so a crash mid-batch retries.
