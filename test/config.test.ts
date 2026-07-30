@@ -1,22 +1,17 @@
 import { describe, it, expect } from 'vitest';
 import { loadConfig } from '../src/config.js';
 
-const validMailboxes = JSON.stringify([
-  { label: 'Work', host: 'imap.hostinger.com', port: 993, user: 'me@x.com', pass: 'secret' },
-]);
-
 const baseEnv = {
   TELEGRAM_BOT_TOKEN: '123:ABC',
   TELEGRAM_CHAT_ID: '999',
-  MAILBOXES: validMailboxes,
+  MASTER_KEY: 'k'.repeat(32),
 };
 
 describe('loadConfig', () => {
   it('parses a valid environment', () => {
     const cfg = loadConfig({ ...baseEnv });
     expect(cfg.telegramBotToken).toBe('123:ABC');
-    expect(cfg.mailboxes).toHaveLength(1);
-    expect(cfg.mailboxes[0]!.label).toBe('Work');
+    expect(cfg.masterKey).toBe('k'.repeat(32));
   });
 
   it('applies defaults for optional settings', () => {
@@ -25,7 +20,6 @@ describe('loadConfig', () => {
     expect(cfg.previewChars).toBe(200);
     expect(cfg.dbPath).toBe('/data/seen.db');
     expect(cfg.healthPort).toBe(8080);
-    expect(cfg.mailboxes[0]!.secure).toBe(true);
   });
 
   it('coerces numeric overrides from strings', () => {
@@ -39,55 +33,27 @@ describe('loadConfig', () => {
     expect(() => loadConfig(rest)).toThrow(/TELEGRAM_BOT_TOKEN/);
   });
 
-  it('throws a clear error when MAILBOXES is not valid JSON', () => {
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: 'not json' })).toThrow(/MAILBOXES.*JSON/i);
+  it('throws when MASTER_KEY is missing', () => {
+    const { MASTER_KEY: _omit, ...rest } = baseEnv;
+    expect(() => loadConfig(rest)).toThrow(/MASTER_KEY/);
   });
 
-  it('throws when MAILBOXES is an empty array', () => {
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: '[]' })).toThrow(/at least one/i);
+  it('throws when MASTER_KEY is too short, and says how to make one', () => {
+    expect(() => loadConfig({ ...baseEnv, MASTER_KEY: 'short' })).toThrow(/at least 32/);
+    expect(() => loadConfig({ ...baseEnv, MASTER_KEY: 'short' })).toThrow(/openssl rand/);
   });
 
-  it('throws when a mailbox entry is missing a field', () => {
-    const bad = JSON.stringify([{ label: 'Work', host: 'h', port: 993 }]);
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: bad })).toThrow(/user/);
-  });
-
-  // --- Finding 5: two mailboxes sharing a label silently lose all mail for
-  // both ---
-  //
-  // folder_state and the seen-message dedup table are both keyed on
-  // (account_label, ...). Two accounts sharing a label alternately clobber
-  // each other's high-water mark and each read the other's uidValidity,
-  // so every sweep re-baselines and notifies nothing -- silent total mail
-  // loss for both accounts, with /healthz still green. This is trivially
-  // caused by copying a MAILBOXES entry and forgetting to change the label.
-
-  it('throws a clear error naming the label when two mailboxes share a label', () => {
-    const duplicateLabels = JSON.stringify([
-      { label: 'Work', host: 'imap.hostinger.com', port: 993, user: 'a@x.com', pass: 'secret' },
-      { label: 'Work', host: 'imap.other.com', port: 993, user: 'b@x.com', pass: 'secret' },
-    ]);
-
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: duplicateLabels })).toThrow(/duplicate/i);
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: duplicateLabels })).toThrow(/Work/);
-  });
-
-  it('allows two mailboxes with distinct labels', () => {
-    const distinctLabels = JSON.stringify([
-      { label: 'Work', host: 'imap.hostinger.com', port: 993, user: 'a@x.com', pass: 'secret' },
-      { label: 'Personal', host: 'imap.other.com', port: 993, user: 'b@x.com', pass: 'secret' },
-    ]);
-
-    expect(() => loadConfig({ ...baseEnv, MAILBOXES: distinctLabels })).not.toThrow();
-  });
-
-  it('never includes passwords in error messages', () => {
-    const bad = JSON.stringify([{ label: 'Work', host: 'h', port: 'nope', user: 'u', pass: 'hunter2' }]);
+  it('never includes the master key itself in an error message', () => {
     try {
-      loadConfig({ ...baseEnv, MAILBOXES: bad });
+      loadConfig({ ...baseEnv, MASTER_KEY: 'sekrit' });
       expect.unreachable('should have thrown');
     } catch (err) {
-      expect((err as Error).message).not.toContain('hunter2');
+      expect((err as Error).message).not.toContain('sekrit');
     }
+  });
+
+  it('ignores a leftover MAILBOXES variable', () => {
+    const cfg = loadConfig({ ...baseEnv, MAILBOXES: '[{"label":"x"}]' });
+    expect(cfg).not.toHaveProperty('mailboxes');
   });
 });
