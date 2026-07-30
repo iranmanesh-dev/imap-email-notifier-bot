@@ -22,22 +22,34 @@ COPY tsconfig.json ./
 COPY src ./src
 # `npm rebuild --build-from-source` was tried first and turned out to be a
 # no-op for this package (it ships no install/postinstall script, so npm's
-# rebuild has nothing to hook into). node-gyp is invoked directly instead,
-# using the copy npm itself bundles.
+# rebuild has nothing to hook into). node-gyp is invoked directly instead
+# via `npx`, backed by `node-gyp` as an explicit devDependency (see
+# package.json) rather than reaching into npm's own bundled copy at a
+# hardcoded internal path -- more standard, and doesn't break if a future
+# npm version moves or removes its vendored node-gyp.
 #
-# The prebuilds directory is removed BEFORE invoking node-gyp, not after:
-# better-sqlite3's binding.gyp checks `prebuild_exists% : '<!(node
-# lib/binding.js)'` at gyp-configure time and makes its compile target a
-# `type: 'none'` no-op whenever a prebuild for the host platform is present
-# -- discovered by first deleting prebuilds afterwards and getting a clean
-# build that had actually only touched stamp files with no compiled .node
-# at all. Deleting first forces the real CC/CXX/SOLINK_MODULE compile,
-# producing a build/Release/better_sqlite3.node that matches this exact
-# runtime glibc. Verified by running the resulting module before trusting
-# it (the `node -e require(...)` line below fails the build otherwise).
+# The prebuilds directory is removed BEFORE invoking node-gyp, not after,
+# for two independent reasons, both load-bearing:
+#   1. (build time) better-sqlite3's binding.gyp checks `prebuild_exists% :
+#      '<!(node lib/binding.js)'` at gyp-configure time and makes its
+#      compile target a `type: 'none'` no-op whenever a prebuild for the
+#      host platform is present -- discovered by first deleting prebuilds
+#      afterwards and getting a "successful" build that had actually only
+#      touched stamp files with no compiled .node at all. `--force_build=1`
+#      alone does not override this the way it looks like it should.
+#   2. (run time, found on review) even with a real compiled binary sitting
+#      in build/Release, `better-sqlite3/lib/binding.js`'s getBinding()
+#      checks getPrebuildPath() FIRST and only falls back to build/Release
+#      if no prebuild file exists. So even a successful from-source compile
+#      would silently load the broken bundled prebuild at runtime unless
+#      prebuilds/ is gone -- `rm -rf prebuilds` is not just a way to force
+#      the compile, it is what makes the compiled output the thing that
+#      actually loads.
+# Verified by running the resulting module before trusting it (the
+# `node -e require(...)` line below fails the whole build otherwise).
 RUN npm run build && \
     rm -rf node_modules/better-sqlite3/prebuilds && \
-    (cd node_modules/better-sqlite3 && node /usr/local/lib/node_modules/npm/node_modules/node-gyp/bin/node-gyp.js rebuild --release) && \
+    npx node-gyp rebuild --release --force_build=1 -C node_modules/better-sqlite3 && \
     node -e "require('./node_modules/better-sqlite3')" && \
     npm prune --omit=dev
 
@@ -59,27 +71,49 @@ USER node
 
 EXPOSE 8080
 
-# Timing deviates from a naive interval=30s/retries=3 default. The daemon's
-# own reconnect loop (src/imap/watcher.ts) backs off exponentially per
-# account (1s, 2s, 4s, ... capped at 5min) for up to 20 consecutive
-# failures before giving up on that one account, and /healthz reports 503
-# while ANY account is merely 'reconnecting' (see src/health.ts). With
-# interval=30s/retries=3/start-period=20s, a container would be marked
-# unhealthy after only ~110s of a degraded account -- well inside the range
-# of an ordinary transient IMAP blip (a server restart, a brief network
-# hiccup) that the app is already recovering from on its own. Marking (and
-# potentially restarting) the container mid-recovery would throw away that
-# progress for no benefit: a restart cannot fix a still-unreachable IMAP
-# host, and cannot fix a bad password either (auth-failed is deliberately
-# terminal per-account and env vars don't change across a restart).
+# This HEALTHCHECK deliberately checks LIVENESS ONLY -- did /healthz answer
+# at all -- and ignores the HTTP status code entirely. An earlier version of
+# this file failed on r.ok (i.e. treated the app's own 503-while-degraded
+# response as unhealthy) and got the following wrong, per review:
 #
-# start-period=45s gives the initial concurrent connect attempts (all
-# accounts, Promise.allSettled) room to succeed before failures start
-# counting. interval=30s/retries=5 requires ~150s of continuously degraded
-# state (roughly the app's own first 6-7 backoff attempts) before flipping
-# unhealthy -- long enough to ride out a normal transient outage, short
-# enough to still surface a genuinely stuck daemon.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=5 \
-  CMD node -e "fetch('http://127.0.0.1:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+# A container HEALTHCHECK's only real lever is provoking a restart (Docker
+# itself doesn't restart on "unhealthy", but Coolify and other orchestrators
+# do, and Coolify additionally gates a *deploy* on reaching healthy). So the
+# only question that matters is: is there a degraded state a restart fixes?
+#   - 'reconnecting': a restart resets AccountWatcher's backoff `attempt` to
+#     0, making the replacement MORE aggressive against a mailbox that's
+#     already mid-recovery on its own -- strictly worse, not fixed.
+#   - 'auth-failed': env vars don't change across a restart, so it just
+#     re-submits the same wrong password and re-sends the Telegram alert.
+#     Repeated failed IMAP logins are exactly what gets a VPS IP blocked.
+#   - 'connect-failed': a restart zeroes the per-account consecutive-failure
+#     counter, defeating MAX_CONSECUTIVE_FAILURES=20 (src/imap/watcher.ts) at
+#     the orchestration layer -- an unbounded retry loop across restarts,
+#     when that cap exists specifically to bound it.
+#   - a genuinely wedged process / dead-but-bound event loop / health server
+#     that never bound: `fetch` itself fails or times out here regardless of
+#     status-code handling, so liveness-only already catches this.
+# Every degraded-but-alive state a restart could theoretically "fix" is a
+# state a restart actively makes worse or does nothing for; every case a
+# restart legitimately helps is already caught by liveness alone. So the
+# status code is checked for nothing and cost real harm (restart loops,
+# and Coolify marking an in-spec degraded deploy as FAILED and possibly
+# rolling it back). Degraded-account visibility instead goes through three
+# channels that aren't "kill the process": the /healthz response body
+# (still 503 with `{status, accounts}` detail -- see src/health.ts), the
+# Telegram alert AccountWatcher's onFatal sends, and stderr. See README.
+#
+# --retries=3 (down from a wider window this file used when the status code
+# still mattered): only liveness needs covering now, so the multi-minute
+# reconnect-backoff runway is irrelevant. --start-period=45s is kept: it's
+# sized for the initial concurrent connect attempts (all accounts via
+# Promise.allSettled) to run and the health server to bind, not for any
+# degraded state to clear.
+#
+# HEALTH_PORT is read from process.env here (not hardcoded) so this check
+# can't silently diverge from a deployment that overrides HEALTH_PORT --
+# see src/config.ts's own HEALTH_PORT default (8080), mirrored below.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=45s --retries=3 \
+  CMD node -e "const p=process.env.HEALTH_PORT||'8080';fetch('http://127.0.0.1:'+p+'/healthz').then(()=>process.exit(0)).catch(()=>process.exit(1))"
 
 CMD ["node", "dist/index.js"]
