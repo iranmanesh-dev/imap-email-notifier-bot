@@ -10,7 +10,30 @@ const accountSchema = z.object({
   secure: z.boolean().default(true),
 });
 
-const mailboxesSchema = z.array(accountSchema).min(1, 'MAILBOXES must contain at least one mailbox');
+const mailboxesSchema = z
+  .array(accountSchema)
+  .min(1, 'MAILBOXES must contain at least one mailbox')
+  // folder_state and the seen-message dedup table are both keyed on
+  // (account_label, ...). Two mailboxes sharing a label alternately clobber
+  // each other's high-water mark and each read the other's uidValidity, so
+  // every sweep re-baselines and notifies nothing -- silent total mail loss
+  // for both accounts, with /healthz still reporting ok. This is trivially
+  // caused by copying a MAILBOXES entry and forgetting to change the label,
+  // so fail loudly at boot instead of letting it wedge silently at runtime.
+  .superRefine((mailboxes, ctx) => {
+    const seenLabels = new Set<string>();
+    mailboxes.forEach((mailbox, index) => {
+      if (seenLabels.has(mailbox.label)) {
+        ctx.addIssue({
+          code: 'custom',
+          message: `duplicate mailbox label "${mailbox.label}": every mailbox must have a unique label`,
+          path: [index, 'label'],
+        });
+      } else {
+        seenLabels.add(mailbox.label);
+      }
+    });
+  });
 
 /** Strips values from zod issues so passwords never reach logs. */
 function describeIssues(prefix: string, error: z.ZodError): string {

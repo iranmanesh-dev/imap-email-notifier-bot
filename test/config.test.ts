@@ -52,6 +52,35 @@ describe('loadConfig', () => {
     expect(() => loadConfig({ ...baseEnv, MAILBOXES: bad })).toThrow(/user/);
   });
 
+  // --- Finding 5: two mailboxes sharing a label silently lose all mail for
+  // both ---
+  //
+  // folder_state and the seen-message dedup table are both keyed on
+  // (account_label, ...). Two accounts sharing a label alternately clobber
+  // each other's high-water mark and each read the other's uidValidity,
+  // so every sweep re-baselines and notifies nothing -- silent total mail
+  // loss for both accounts, with /healthz still green. This is trivially
+  // caused by copying a MAILBOXES entry and forgetting to change the label.
+
+  it('throws a clear error naming the label when two mailboxes share a label', () => {
+    const duplicateLabels = JSON.stringify([
+      { label: 'Work', host: 'imap.hostinger.com', port: 993, user: 'a@x.com', pass: 'secret' },
+      { label: 'Work', host: 'imap.other.com', port: 993, user: 'b@x.com', pass: 'secret' },
+    ]);
+
+    expect(() => loadConfig({ ...baseEnv, MAILBOXES: duplicateLabels })).toThrow(/duplicate/i);
+    expect(() => loadConfig({ ...baseEnv, MAILBOXES: duplicateLabels })).toThrow(/Work/);
+  });
+
+  it('allows two mailboxes with distinct labels', () => {
+    const distinctLabels = JSON.stringify([
+      { label: 'Work', host: 'imap.hostinger.com', port: 993, user: 'a@x.com', pass: 'secret' },
+      { label: 'Personal', host: 'imap.other.com', port: 993, user: 'b@x.com', pass: 'secret' },
+    ]);
+
+    expect(() => loadConfig({ ...baseEnv, MAILBOXES: distinctLabels })).not.toThrow();
+  });
+
   it('never includes passwords in error messages', () => {
     const bad = JSON.stringify([{ label: 'Work', host: 'h', port: 'nope', user: 'u', pass: 'hunter2' }]);
     try {
