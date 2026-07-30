@@ -966,6 +966,118 @@ describe('AccountWatcher', () => {
     });
   });
 
+  // --- Final review, finding 4: the password reached unscrubbed
+  // console.error in the watcher ---
+  //
+  // probe.ts states the governing premise: IMAP servers and libraries
+  // sometimes echo the credentials they were given, so scrubbing at the
+  // boundary is the only reliable place. That premise cannot be selectively
+  // true — probeMailbox and AccountWatcher use the same credentials against
+  // the same server, and the watcher logs on every failure, making it the
+  // higher-volume channel.
+
+  const leakyAccount: Account = { ...account, pass: 'p@ssw0rd-t0psecret' };
+
+  it('never leaks the password when a connection failure echoes it back', async () => {
+    await withStore(async (store) => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const connect = vi.fn(async () => {
+          throw new Error(
+            `LOGIN failed: "a1 LOGIN ${leakyAccount.user} ${leakyAccount.pass}" rejected`
+          );
+        });
+
+        const watcher = new AccountWatcher({
+          account: leakyAccount,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { connect, runSweep: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        await watcher.stop();
+
+        const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(logged).toContain('connection failed'); // the log line really happened
+        expect(logged).not.toContain(leakyAccount.pass);
+        expect(logged).toContain('***');
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
+  it('never leaks the password when a sweep failure echoes it back', async () => {
+    await withStore(async (store) => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        let sweepCalls = 0;
+        const runSweep = vi.fn(async () => {
+          sweepCalls += 1;
+          if (sweepCalls === 1) {
+            throw new Error(`re-auth rejected for ${leakyAccount.user}/${leakyAccount.pass}`);
+          }
+        });
+
+        const watcher = new AccountWatcher({
+          account: leakyAccount,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { runSweep, connect: async () => {}, disconnect: async () => {}, sleep: async () => {} },
+        });
+
+        await watcher.start();
+        await watcher.stop();
+
+        const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(logged).toContain('sweep failed');
+        expect(logged).not.toContain(leakyAccount.pass);
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
+  it("never leaks the password through the sweep or idle clients' error events", async () => {
+    await withStore(async (store) => {
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        const { factory, records } = createTrackedClientFactory();
+
+        const watcher = new AccountWatcher({
+          account: leakyAccount,
+          store,
+          previewChars: 200,
+          sweepIntervalSeconds: 3600,
+          onEmail: async () => {},
+          onFatal: async () => {},
+          deps: { createClientImpl: factory, sleep: async () => {} },
+        });
+
+        await watcher.start();
+
+        records[0]!.emit('error', new Error(`socket closed mid-LOGIN ${leakyAccount.pass}`));
+        records[1]!.emit('error', new Error(`idle died after LOGIN ${leakyAccount.pass}`));
+
+        const logged = errorSpy.mock.calls.map((c) => String(c[0])).join('\n');
+        expect(logged).toContain('sweep client error');
+        expect(logged).toContain('idler error');
+        expect(logged).not.toContain(leakyAccount.pass);
+
+        await watcher.stop();
+      } finally {
+        errorSpy.mockRestore();
+      }
+    });
+  });
+
   // --- Final review, finding 2 (CRITICAL): stop() did not await the
   // in-flight sweep chain ---
   //

@@ -1,6 +1,7 @@
 import type { ImapFlow } from 'imapflow';
 import { createClient, imapSweepDeps, isAuthError } from './client.js';
 import { sweep, errorMessage } from './sweeper.js';
+import { scrubSecret } from '../scrub.js';
 import type { SeenStore } from '../store/seen.js';
 import type { Account, NormalizedEmail } from '../types.js';
 
@@ -94,6 +95,18 @@ export class AccountWatcher {
 
   get label(): string {
     return this.#opts.account.label;
+  }
+
+  /**
+   * Formats a caught value for logging with this account's password removed.
+   * Every `console.error` in this class that interpolates an error goes
+   * through here: `registry.add(account)` is called with the plaintext
+   * password in `account.pass`, and a server that echoes a rejected LOGIN
+   * back would otherwise put it straight into the container log on every
+   * retry.
+   */
+  #logSafe(err: unknown): string {
+    return scrubSecret(errorMessage(err), this.#opts.account.pass);
   }
 
   async start(): Promise<void> {
@@ -216,7 +229,7 @@ export class AccountWatcher {
 
         this.#consecutiveFailures += 1;
         console.error(
-          `[${this.#opts.account.label}] connection failed: ${errorMessage(err)}; retrying`
+          `[${this.#opts.account.label}] connection failed: ${this.#logSafe(err)}; retrying`
         );
 
         if (this.#consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -285,7 +298,7 @@ export class AccountWatcher {
     // needs this listener just as much as the idle client does. Never logs
     // more than the account label and error message.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] sweep client error: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] sweep client error: ${this.#logSafe(err)}`);
     });
     if (this.#stopped) {
       // stop() ran while client.connect() was in flight. stop() has already
@@ -327,7 +340,7 @@ export class AccountWatcher {
     // window between connect() and this listener unprotected would still
     // let a drop in exactly that window crash the process.
     client.on('error', (err: Error) => {
-      console.error(`[${this.#opts.account.label}] idler error: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] idler error: ${this.#logSafe(err)}`);
     });
     if (this.#stopped) {
       // Same race as #connectSweep: stop() ran while we were connecting.
@@ -439,7 +452,7 @@ export class AccountWatcher {
         if (result.failures.length > 0) {
           console.error(
             `[${this.#opts.account.label}] sweep completed with ${result.failures.length} folder failure(s): ${result.failures
-              .map((f) => `${f.folder}: ${f.message}`)
+              .map((f) => `${f.folder}: ${scrubSecret(f.message, this.#opts.account.pass)}`)
               .join('; ')}`
           );
         }
@@ -454,7 +467,7 @@ export class AccountWatcher {
       if (!this.#stopped) this.#state = 'ok';
     } catch (err) {
       if (!this.#stopped) this.#state = 'reconnecting';
-      console.error(`[${this.#opts.account.label}] sweep failed: ${errorMessage(err)}`);
+      console.error(`[${this.#opts.account.label}] sweep failed: ${this.#logSafe(err)}`);
       // Only the sweep client is suspect here; #connectSweep leaves the
       // idle client (and its watchdog) completely alone.
       const reconnected = await this.#connectWithRetry(() => this.#connectSweep());
