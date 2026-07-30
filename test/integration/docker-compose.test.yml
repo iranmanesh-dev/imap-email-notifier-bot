@@ -2,6 +2,13 @@ services:
   greenmail:
     image: greenmail/standalone:2.1.0
     environment:
+      # `greenmail.hostname=0.0.0.0` is required, not cosmetic: GreenMail binds
+      # its listener sockets to 127.0.0.1 *inside the container* by default.
+      # With that default, `docker port`/`docker ps` both report the 3143/3025
+      # mappings as present and correct, but every connection from the host is
+      # silently closed with no IMAP/SMTP banner at all — it reads exactly
+      # like a Docker networking problem and is not. Remove this line to
+      # reproduce that failure mode.
       GREENMAIL_OPTS: >-
         -Dgreenmail.setup.test.all
         -Dgreenmail.hostname=0.0.0.0

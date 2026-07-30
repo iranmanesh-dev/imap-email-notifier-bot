@@ -89,6 +89,20 @@ async function currentCount(path: string): Promise<number> {
   return status.messages ?? 0;
 }
 
+/** Looks up the server-assigned UID for a message by its Message-ID. */
+async function uidFor(path: string, messageId: string): Promise<number> {
+  const lock = await client.getMailboxLock(path);
+  try {
+    const uids = await client.search({ header: { 'message-id': messageId } }, { uid: true });
+    if (uids === false || uids.length === 0) {
+      throw new Error(`no UID found for message ${messageId} in ${path}`);
+    }
+    return uids[0]!;
+  } finally {
+    lock.release();
+  }
+}
+
 /** Unique per test-run AND per call, so retries within a test never collide. */
 function uniqueId(label: string): string {
   testCounter += 1;
@@ -154,6 +168,7 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     const run = collector();
     const result = await sweep(deps, run.opts);
     expect(result.failures).toEqual([]);
+    expect(result.foldersChecked).toBeGreaterThan(0);
 
     const delivered = run.received.filter((e) => e.messageId === id);
     expect(delivered).toHaveLength(1);
@@ -186,6 +201,9 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(quiet.received).toHaveLength(0);
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(result.failures).toEqual([]);
+    // Guards against this passing vacuously: with zero folders returned by
+    // deps.list(), there would trivially be no fetch and no notification too.
+    expect(result.foldersChecked).toBeGreaterThan(0);
     fetchSpy.mockRestore();
   });
 
@@ -292,6 +310,16 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     await sendMail('Fails once then delivers', failId);
     await waitForCount('INBOX', before + 2);
 
+    // The sweeper sorts fetched messages by UID and aborts the folder on the
+    // first throw (see sweeper.ts), so this test's behaviour depends on
+    // okId's UID being lower than failId's. Sequential, awaited sends make
+    // that true in practice, but assert it explicitly against the real
+    // server rather than leaving it as an invisible assumption — this is
+    // what would catch a regression if the sends were ever parallelised.
+    const okUid = await uidFor('INBOX', okId);
+    const failUid = await uidFor('INBOX', failId);
+    expect(okUid).toBeLessThan(failUid);
+
     const delivered: NormalizedEmail[] = [];
     const firstAttempt = {
       accountLabel: 'Retry',
@@ -311,6 +339,10 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     expect(firstResult.failures.length).toBeGreaterThan(0);
     expect(delivered.map((e) => e.messageId)).toContain(okId);
     expect(delivered.map((e) => e.messageId)).not.toContain(failId);
+    // The INBOX folder itself failed (that's the point of this test), but
+    // foldersChecked must still reflect that other folders were genuinely
+    // swept, not that deps.list() returned nothing.
+    expect(firstResult.foldersChecked).toBeGreaterThan(0);
 
     const secondAttempt = {
       accountLabel: 'Retry',
@@ -322,6 +354,7 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     };
     const secondResult = await sweep(deps, secondAttempt);
     expect(secondResult.failures).toEqual([]);
+    expect(secondResult.foldersChecked).toBeGreaterThan(0);
 
     // failId is now delivered, exactly once overall; okId was not re-sent.
     const failDeliveries = delivered.filter((e) => e.messageId === failId);
