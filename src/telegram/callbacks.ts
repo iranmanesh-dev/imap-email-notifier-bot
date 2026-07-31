@@ -1,68 +1,22 @@
 import {
-  backKeyboard, cancelKeyboard, confirmRemoveKeyboard, decodeAction, hostPickKeyboard,
-  mailboxKeyboard, menuKeyboard, portPickKeyboard, resolveToken,
+  backKeyboard, confirmRemoveKeyboard, decodeAction, mailboxKeyboard, menuKeyboard,
   type CallbackAction,
 } from './keyboards.js';
-import type { InlineKeyboard } from './sender.js';
 import type { TelegramUpdate } from './receiver.js';
-import {
-  WIZARD_TTL_MS, cancellationNotice, type Conversations, type Pending,
-} from './conversation.js';
-import type { MailboxStore } from '../store/mailboxes.js';
-import type { SeenStore } from '../store/seen.js';
-import type { WatcherRegistry } from '../imap/registry.js';
-import type { ProbeResult } from '../imap/probe.js';
+import { cancellationNotice } from './conversation.js';
 import type { Account } from '../types.js';
 import { escapeHtml } from '../mail/format.js';
 import { HTML_STATUS, buildStatusReport } from './status.js';
 import { scrubSecret } from '../scrub.js';
+import {
+  errorText, readLabels, renderMenu, resolveOrReport, show, type CallbackDeps,
+} from './render.js';
+import { applyHost, applyPort, promptTyped, startWizard } from './wizard.js';
 
-export type CallbackDeps = {
-  operatorChatId: string;
-  mailboxes: MailboxStore;
-  seen: Pick<SeenStore, 'purgeAccount'>;
-  registry: WatcherRegistry;
-  conversations: Conversations;
-  probe: (account: Account) => Promise<ProbeResult>;
-  // No `text` parameter: Telegram's optional toast was never populated by
-  // any call site, and a parameter nothing supplies reads as a feature that
-  // exists. TelegramSender.answerCallbackQuery still accepts one if a toast
-  // is ever actually wanted.
-  answer: (callbackQueryId: string) => Promise<boolean>;
-  edit: (messageId: number, html: string, keyboard?: InlineKeyboard) => Promise<boolean>;
-  reply: (html: string, keyboard?: InlineKeyboard) => Promise<void>;
-  now: () => number;
-};
-
-const MENU_TEXT = '📬 <b>Mailboxes</b>\nChoose an action.';
-
-/**
- * Renders content into the tapped message, falling back to a new message.
- *
- * Telegram refuses to edit messages older than 48 hours, so without the
- * fallback a button tapped on a day-old menu would silently do nothing.
- *
- * `deps.edit` must therefore report true whenever the message now DISPLAYS
- * the requested content — not merely when an edit was performed. Telegram
- * 400s a no-op edit with "message is not modified", and treating that as a
- * refusal made double-tapping Back append a duplicate menu every time.
- * Only the sender can see that description, so the distinction is made
- * there (see TelegramSender.editMessageText) and the contract is stated
- * here, where the fallback depends on it.
- */
-async function show(
-  deps: CallbackDeps,
-  messageId: number | undefined,
-  html: string,
-  keyboard?: InlineKeyboard
-): Promise<void> {
-  if (messageId !== undefined && (await deps.edit(messageId, html, keyboard))) return;
-  await deps.reply(html, keyboard);
-}
-
-export async function renderMenu(deps: CallbackDeps, messageId?: number): Promise<void> {
-  await show(deps, messageId, MENU_TEXT, menuKeyboard());
-}
+// Re-exported so consumers keep one import site for the button surface, and
+// so `renderMenu`'s only other caller (deps.ts) does not need to know that
+// the shared primitives were split out of here.
+export { renderMenu, type CallbackDeps };
 
 /**
  * Entry point for every button tap.
@@ -164,37 +118,6 @@ async function cancelPendingUnlessOwned(
   await deps.reply(escapeHtml(cancellationNotice(pending)));
 }
 
-/**
- * Puts back a pending entry a quick-pick consumed but did not match — or
- * cancels it, when putting it back would be dangerous.
- *
- * The four quick-picks are exempt from the blanket cancel-on-tap rule
- * because they consume their own step, so they alone decide what happens to
- * a MISMATCHED entry. That decision differs by kind:
- *
- * - `wizard-*`: restore it. The operator's setup is live, they tapped a
- *   button on a stale message, and destroying their place would be the
- *   worse failure. Restored unchanged, so a tap cannot extend its TTL.
- * - `password` / `remove-confirm`: cancel it, with the shared notice.
- *   Restoring these reproduces the exact Critical this file was fixed for:
- *   the operator is shown a menu — every cue saying the context moved on —
- *   while a password prompt stays armed, so their next ordinary message is
- *   deleted from Telegram and transmitted as a password to a real IMAP
- *   server. A live wizard step is worth protecting; an armed password
- *   prompt behind a menu screen is not.
- */
-async function restoreOrCancel(
-  deps: CallbackDeps,
-  chatId: number,
-  pending: Pending
-): Promise<void> {
-  if (pending.kind === 'password' || pending.kind === 'remove-confirm') {
-    await deps.reply(escapeHtml(cancellationNotice(pending)));
-    return;
-  }
-  deps.conversations.set(chatId, pending);
-}
-
 async function dispatch(
   action: CallbackAction,
   deps: CallbackDeps,
@@ -234,55 +157,6 @@ async function dispatch(
     default:
       return renderMenu(deps, messageId);
   }
-}
-
-/**
- * Reads the saved labels, or reports why it could not.
- *
- * labels() hits SQLite and can throw. Unguarded, that throw lands in
- * handleCallback's catch — which logs, clears the spinner and says nothing,
- * leaving the operator with a button that visibly did nothing at all. Same
- * guard buildStatusReport applies for the same call.
- */
-async function readLabels(
-  deps: CallbackDeps,
-  messageId: number | undefined
-): Promise<string[] | null> {
-  try {
-    return deps.mailboxes.labels();
-  } catch (err) {
-    await show(
-      deps,
-      messageId,
-      `Could not read the saved mailbox list: ${escapeHtml(errorText(err))}`,
-      menuKeyboard()
-    );
-    return null;
-  }
-}
-
-/**
- * Resolves a token to a live label, or reports a stale button.
- *
- * Telegram keeps old messages tappable indefinitely, so a button referring
- * to a since-deleted mailbox is normal, not exceptional. A callback is never
- * treated as evidence that its target still exists.
- *
- * A null return means "do not act": either the mailbox is gone, or the list
- * could not be read at all. Both have already been reported.
- */
-async function resolveOrReport(
-  deps: CallbackDeps,
-  messageId: number | undefined,
-  token: string
-): Promise<string | null> {
-  const labels = await readLabels(deps, messageId);
-  if (labels === null) return null;
-  const label = resolveToken(token, labels);
-  if (label === null) {
-    await show(deps, messageId, 'That mailbox no longer exists.', menuKeyboard());
-  }
-  return label;
 }
 
 async function confirmRemove(
@@ -402,117 +276,6 @@ async function doTest(
   await show(deps, messageId, text, backKeyboard());
 }
 
-export async function startWizard(
-  deps: CallbackDeps,
-  chatId: number,
-  messageId: number | undefined
-): Promise<void> {
-  deps.conversations.set(chatId, {
-    kind: 'wizard-label',
-    expiresAt: deps.now() + WIZARD_TTL_MS,
-  });
-  await show(
-    deps,
-    messageId,
-    'What should this mailbox be called? Send a short label, e.g. <b>Work</b>.',
-    cancelKeyboard()
-  );
-}
-
-/**
- * A quick-pick only makes sense while its step is pending. Tapping a stale
- * host button from an old message must not invent a wizard out of nothing.
- */
-async function applyHost(
-  deps: CallbackDeps,
-  chatId: number,
-  messageId: number | undefined,
-  host: string
-): Promise<void> {
-  const pending = deps.conversations.take(chatId, deps.now());
-  if (pending === null) {
-    return renderMenu(deps, messageId);
-  }
-  if (pending.kind !== 'wizard-host') {
-    // A stray tap on a stale host button while a DIFFERENT step is pending
-    // must not destroy that step — but must not silently keep an armed
-    // password prompt alive behind a menu either. See restoreOrCancel.
-    await restoreOrCancel(deps, chatId, pending);
-    return renderMenu(deps, messageId);
-  }
-  deps.conversations.set(chatId, {
-    kind: 'wizard-port',
-    label: pending.label,
-    host,
-    expiresAt: deps.now() + WIZARD_TTL_MS,
-  });
-  await show(deps, messageId, `Host: <b>${escapeHtml(host)}</b>\n\nWhich port?`, portPickKeyboard());
-}
-
-async function applyPort(
-  deps: CallbackDeps,
-  chatId: number,
-  messageId: number | undefined,
-  port: number
-): Promise<void> {
-  const pending = deps.conversations.take(chatId, deps.now());
-  if (pending === null) {
-    return renderMenu(deps, messageId);
-  }
-  if (pending.kind !== 'wizard-port') {
-    // Same reasoning as applyHost.
-    await restoreOrCancel(deps, chatId, pending);
-    return renderMenu(deps, messageId);
-  }
-  deps.conversations.set(chatId, {
-    kind: 'wizard-username',
-    label: pending.label,
-    host: pending.host,
-    port,
-    expiresAt: deps.now() + WIZARD_TTL_MS,
-  });
-  await show(
-    deps,
-    messageId,
-    `Port: <b>${port}</b>\n\nSend the username or email address for this mailbox.`,
-    cancelKeyboard()
-  );
-}
-
-/**
- * Solicits a typed value for one wizard step — but only while that exact
- * step is pending.
- *
- * A "Type it myself…" button is as tappable on a stale keyboard as any
- * other, and the reply it invites is consumed by whatever step handleUpdate
- * finds pending, not by the step the button belonged to. An operator who
- * restarts the wizard (arming `wizard-host`), taps the OLD port keyboard's
- * "Type it myself…" and dutifully sends `993` would otherwise have that
- * number stored as the mailbox's *host*. Guarding here mirrors applyHost /
- * applyPort, which were hardened against the same mismatch.
- *
- * The entry is restored before any branch: take() is single-use, so a stray
- * tap must not be able to destroy a step the operator is genuinely in the
- * middle of. It is restored unchanged rather than re-armed, so a tap cannot
- * extend a flow's TTL either.
- */
-async function promptTyped(
-  deps: CallbackDeps,
-  chatId: number,
-  messageId: number | undefined,
-  step: 'wizard-host' | 'wizard-port',
-  prompt: string
-): Promise<void> {
-  const pending = deps.conversations.take(chatId, deps.now());
-  if (pending === null) return renderMenu(deps, messageId);
-  if (pending.kind !== step) {
-    await restoreOrCancel(deps, chatId, pending);
-    return renderMenu(deps, messageId);
-  }
-  deps.conversations.set(chatId, pending);
-  await show(deps, messageId, prompt, cancelKeyboard());
-}
-
 async function showList(deps: CallbackDeps, messageId: number | undefined): Promise<void> {
   const boxes = deps.mailboxes.list();
   if (boxes.length === 0) {
@@ -554,8 +317,4 @@ async function showPicker(
   }
   const verb = target === 'remove' ? 'remove' : 'test';
   return show(deps, messageId, `Which mailbox would you like to ${verb}?`, mailboxKeyboard(labels, target));
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
 }
