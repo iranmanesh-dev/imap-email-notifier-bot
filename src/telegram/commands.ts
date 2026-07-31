@@ -1,6 +1,8 @@
 import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, type Conversations } from './conversation.js';
+import { hostPickKeyboard } from './keyboards.js';
 import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
+import type { InlineKeyboard } from './sender.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
 import type { WatcherRegistry } from '../imap/registry.js';
@@ -14,7 +16,9 @@ export type CommandDeps = {
   registry: WatcherRegistry;
   conversations: Conversations;
   probe: (account: Account) => Promise<ProbeResult>;
-  reply: (text: string) => Promise<void>;
+  // Optional so all pre-existing callers/tests (which pass none) keep
+  // working unchanged; only the wizard's host prompt currently uses it.
+  reply: (text: string, keyboard?: InlineKeyboard) => Promise<void>;
   deleteMessage: (messageId: number) => Promise<boolean>;
   now: () => number;
 };
@@ -52,7 +56,10 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
         deps.conversations.set(message.chat.id, {
           kind: 'wizard-host', label: text, expiresAt: deps.now() + WIZARD_TTL_MS,
         });
-        return deps.reply('Which IMAP host? Send it as your next message, e.g. imap.hostinger.com');
+        return deps.reply(
+          'Which IMAP host? Send it as your next message, e.g. imap.hostinger.com',
+          hostPickKeyboard()
+        );
       }
       if (pending.kind === 'wizard-host') {
         deps.conversations.set(message.chat.id, {

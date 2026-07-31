@@ -222,4 +222,29 @@ describe('add wizard', () => {
     expect(edits.at(-1)).toMatch(/mailbox/i);
     expect(deps.conversations.size()).toBe(0);
   });
+
+  it('a stray host quick-pick while a port step is pending restores the port step instead of destroying it', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'Work', host: 'h', expiresAt: NOW + 60_000 });
+    await handleCallback(tap(encodeAction({ kind: 'host', value: 'imap.x.com' })), deps);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    // Merely asserting size() === 1 would also pass if the wrong kind had
+    // been re-set. Taking it back out and checking its kind and fields
+    // proves the operator's actual place in the flow survived the stray tap.
+    expect(deps.conversations.size()).toBe(1);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored?.kind).toBe('wizard-port');
+    expect(restored).toMatchObject({ kind: 'wizard-port', label: 'Work', host: 'h' });
+  });
+
+  it('a stray port quick-pick while a host step is pending restores the host step instead of destroying it', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+    await handleCallback(tap(encodeAction({ kind: 'port', value: 993 })), deps);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    expect(deps.conversations.size()).toBe(1);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored?.kind).toBe('wizard-host');
+    expect(restored).toMatchObject({ kind: 'wizard-host', label: 'Work' });
+  });
 });

@@ -1,7 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { handleUpdate, type CommandDeps } from '../src/telegram/commands.js';
 import { Conversations } from '../src/telegram/conversation.js';
+import { hostPickKeyboard } from '../src/telegram/keyboards.js';
 import type { TelegramUpdate } from '../src/telegram/receiver.js';
+import type { InlineKeyboard } from '../src/telegram/sender.js';
 import type { Account } from '../src/types.js';
 
 const OPERATOR = 42;
@@ -487,6 +489,18 @@ describe('wizard typed steps', () => {
     expect(replies.at(-1)).toMatch(/host/i);
   });
 
+  it('the host prompt carries a host quick-pick keyboard, since typing is the more typo-prone field', async () => {
+    const keyboards: (InlineKeyboard | undefined)[] = [];
+    const { deps } = makeDeps({
+      reply: async (_text: string, keyboard?: InlineKeyboard) => {
+        keyboards.push(keyboard);
+      },
+    });
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('Work'), deps);
+    expect(keyboards.at(-1)).toEqual(hostPickKeyboard());
+  });
+
   it('a typed host advances to the port step', async () => {
     const { deps, replies } = makeDeps();
     deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
@@ -494,12 +508,19 @@ describe('wizard typed steps', () => {
     expect(replies.at(-1)).toMatch(/port/i);
   });
 
-  it('an invalid typed port re-prompts without advancing', async () => {
+  it('an invalid typed port re-prompts without advancing, and a subsequent valid port still advances', async () => {
     const { deps, replies } = makeDeps();
     deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'W', host: 'h', expiresAt: NOW + 60_000 });
     await handleUpdate(msg('not-a-port'), deps);
     expect(replies.at(-1)).toMatch(/port/i);
     expect(deps.conversations.size()).toBe(1);
+
+    // Asserting only size() === 1 would also pass if the re-set entry had
+    // silently become the wrong kind. Driving one more, valid port through
+    // proves the retained state is still genuinely `wizard-port` with its
+    // label and host intact.
+    await handleUpdate(msg('993'), deps);
+    expect(replies.at(-1)).toMatch(/username|email/i);
   });
 
   it('a typed username advances to the password prompt', async () => {

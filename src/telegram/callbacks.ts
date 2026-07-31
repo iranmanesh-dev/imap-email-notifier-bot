@@ -145,7 +145,15 @@ async function applyHost(
   host: string
 ): Promise<void> {
   const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
-  if (pending === null || pending.kind !== 'wizard-host') {
+  if (pending === null) {
+    return renderMenu(deps, messageId);
+  }
+  if (pending.kind !== 'wizard-host') {
+    // A stray tap on a stale host button while a DIFFERENT step (or no
+    // wizard at all) is pending must not destroy that other step. take()
+    // already removed it above, so put it back exactly as it was before
+    // falling through to the menu.
+    deps.conversations.set(Number(deps.operatorChatId), pending);
     return renderMenu(deps, messageId);
   }
   deps.conversations.set(Number(deps.operatorChatId), {
@@ -163,7 +171,13 @@ async function applyPort(
   port: number
 ): Promise<void> {
   const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
-  if (pending === null || pending.kind !== 'wizard-port') {
+  if (pending === null) {
+    return renderMenu(deps, messageId);
+  }
+  if (pending.kind !== 'wizard-port') {
+    // Same reasoning as applyHost: a stray port tap must not destroy a
+    // different pending step. Restore what was actually there.
+    deps.conversations.set(Number(deps.operatorChatId), pending);
     return renderMenu(deps, messageId);
   }
   deps.conversations.set(Number(deps.operatorChatId), {
