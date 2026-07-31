@@ -67,11 +67,15 @@ describe('authorization', () => {
     expect(replies).toEqual([]);
   });
 
-  it('touches nothing for an unauthorized chat — no probe, no store write', async () => {
-    const { deps, probes, stored } = makeDeps();
-    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: 'x' }), 999), deps);
+  it('touches nothing for an unauthorized chat — no probe, no store write, no answer', async () => {
+    const { deps, probes, stored, answers } = makeDeps();
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    const token = labelToken('Work');
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token }), 999), deps);
     expect(probes).toEqual([]);
-    expect(stored.size).toBe(0);
+    expect(stored.size).toBe(1);
+    expect(stored.has('Work')).toBe(true);
+    expect(answers).toEqual([]);
   });
 
   it('ignores an update with no callback_query', async () => {
@@ -124,11 +128,18 @@ describe('menu, list and status', () => {
   });
 
   it('list masks the password', async () => {
+    // The fake `list()` mirrors MailboxSummary — it never exposes `pass` at
+    // all, so a `not.toContain('hunter2')` assertion here would hold no
+    // matter what showList() does with the data. The real guarantee is
+    // structural (MailboxStore.list() never decrypts or returns a
+    // password); what this test can actually exercise is that the display
+    // uses an explicit masked placeholder rather than, say, silently
+    // omitting the field.
     const { deps, edits } = makeDeps();
     deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u@x', pass: 'hunter2', secure: true });
     await handleCallback(tap('l'), deps);
     expect(edits[0]).toContain('Work');
-    expect(edits[0]).not.toContain('hunter2');
+    expect(edits[0]).toContain('••••••••');
   });
 
   it('status reports idle when nothing is watched', async () => {

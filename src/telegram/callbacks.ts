@@ -73,8 +73,16 @@ export async function handleCallback(update: TelegramUpdate, deps: CallbackDeps)
     console.error(`[telegram] callback failed: ${errorText(err)}`);
   } finally {
     // Must happen on every path, including a throw, or the operator's client
-    // shows a spinner on the button until it times out.
-    await deps.answer(query.id).catch(() => false);
+    // shows a spinner on the button until it times out. A plain try/catch is
+    // used rather than `.catch()` on the returned promise, because `.catch`
+    // only handles rejection — an `answer` implementation that throws
+    // synchronously would throw before `.catch` is ever reached and escape
+    // this `finally`, discarding whatever outcome we already have.
+    try {
+      await deps.answer(query.id);
+    } catch {
+      // Answering is cosmetic and must never fail the surrounding handler.
+    }
   }
 }
 
