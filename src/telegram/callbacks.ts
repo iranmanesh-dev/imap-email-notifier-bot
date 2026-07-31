@@ -1,6 +1,6 @@
 import {
-  backKeyboard, cancelKeyboard, decodeAction, hostPickKeyboard, mailboxKeyboard, menuKeyboard,
-  portPickKeyboard,
+  backKeyboard, cancelKeyboard, confirmRemoveKeyboard, decodeAction, hostPickKeyboard,
+  mailboxKeyboard, menuKeyboard, portPickKeyboard, resolveToken,
   type CallbackAction,
 } from './keyboards.js';
 import type { InlineKeyboard } from './sender.js';
@@ -12,6 +12,7 @@ import type { WatcherRegistry } from '../imap/registry.js';
 import type { ProbeResult } from '../imap/probe.js';
 import type { Account } from '../types.js';
 import { escapeHtml } from '../mail/format.js';
+import { scrubSecret } from '../scrub.js';
 
 export type CallbackDeps = {
   operatorChatId: string;
@@ -116,10 +117,94 @@ async function dispatch(
       return show(deps, messageId, 'Send the IMAP host as your next message.', cancelKeyboard());
     case 'type-port':
       return show(deps, messageId, 'Send the port number as your next message.', cancelKeyboard());
+    case 'remove':
+      return confirmRemove(deps, messageId, action.token);
+    case 'remove-confirm':
+      return doRemove(deps, messageId, action.token);
+    case 'test':
+      return doTest(deps, messageId, action.token);
     default:
-      // remove and test actions are added in Task 7.
       return renderMenu(deps, messageId);
   }
+}
+
+/**
+ * Resolves a token to a live label, or reports a stale button.
+ *
+ * Telegram keeps old messages tappable indefinitely, so a button referring
+ * to a since-deleted mailbox is normal, not exceptional. A callback is never
+ * treated as evidence that its target still exists.
+ */
+async function resolveOrReport(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  token: string
+): Promise<string | null> {
+  const label = resolveToken(token, deps.mailboxes.labels());
+  if (label === null) {
+    await show(deps, messageId, 'That mailbox no longer exists.', menuKeyboard());
+  }
+  return label;
+}
+
+async function confirmRemove(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  token: string
+): Promise<void> {
+  const label = await resolveOrReport(deps, messageId, token);
+  if (label === null) return;
+  await show(
+    deps,
+    messageId,
+    `Remove <b>${escapeHtml(label)}</b>?\nThis deletes its credentials and notification history.`,
+    confirmRemoveKeyboard(token)
+  );
+}
+
+async function doRemove(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  token: string
+): Promise<void> {
+  const label = await resolveOrReport(deps, messageId, token);
+  if (label === null) return;
+
+  await deps.registry.remove(label);
+  deps.mailboxes.remove(label);
+  deps.seen.purgeAccount(label);
+  await show(deps, messageId, `Removed <b>${escapeHtml(label)}</b> and stopped watching it.`, menuKeyboard());
+}
+
+async function doTest(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  token: string
+): Promise<void> {
+  const label = await resolveOrReport(deps, messageId, token);
+  if (label === null) return;
+
+  let account: Account | null;
+  try {
+    account = deps.mailboxes.get(label);
+  } catch (err) {
+    // Decryption can fail if MASTER_KEY changed. Report it — silence here is
+    // indistinguishable from "mail stopped arriving".
+    return show(deps, messageId, `Could not read <b>${escapeHtml(label)}</b>: ${escapeHtml(errorText(err))}`, backKeyboard());
+  }
+  if (account === null) {
+    return show(deps, messageId, 'That mailbox no longer exists.', menuKeyboard());
+  }
+
+  const result = await deps.probe(account);
+  // probeMailbox already scrubs its own reason, but this is the last place
+  // that can still guarantee it before the text reaches the operator, and
+  // `probe` is an injected dependency — the same defense-in-depth commands.ts
+  // applies in testMailbox.
+  const text = result.ok
+    ? `<b>${escapeHtml(label)}</b> connected — ${result.folders} folders.`
+    : `<b>${escapeHtml(label)}</b> failed to connect.\n\n${escapeHtml(scrubSecret(result.reason, account.pass))}`;
+  await show(deps, messageId, text, backKeyboard());
 }
 
 export async function startWizard(deps: CallbackDeps, messageId: number | undefined): Promise<void> {

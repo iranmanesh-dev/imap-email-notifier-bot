@@ -2,7 +2,7 @@ import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { SeenStore } from './store/seen.js';
 import { TelegramSender } from './telegram/sender.js';
-import type { SendOutcome } from './telegram/sender.js';
+import type { SendOutcome, InlineKeyboard } from './telegram/sender.js';
 import { formatEmail, escapeHtml } from './mail/format.js';
 import { AccountWatcher } from './imap/watcher.js';
 import type { WatcherState } from './imap/watcher.js';
@@ -13,7 +13,8 @@ import { WatcherRegistry } from './imap/registry.js';
 import { probeMailbox } from './imap/probe.js';
 import { Conversations } from './telegram/conversation.js';
 import { runReceiver, FatalTelegramError } from './telegram/receiver.js';
-import { handleUpdate } from './telegram/commands.js';
+import { handleUpdate, type CommandDeps } from './telegram/commands.js';
+import { handleCallback, renderMenu, type CallbackDeps } from './telegram/callbacks.js';
 import type { Account, NormalizedEmail } from './types.js';
 
 const PRUNE_AFTER_DAYS = 30;
@@ -569,6 +570,46 @@ async function main(): Promise<void> {
     });
   };
 
+  // The callback deps take ALREADY-ESCAPED HTML — callbacks.ts escapes each
+  // interpolated field itself, because (unlike commands.ts) it emits
+  // intentional <b> markup. Escaping the whole string again here would show
+  // the operator literal "&amp;lt;"-style double-escaped markup.
+  const callbackDeps: CallbackDeps = {
+    operatorChatId,
+    mailboxes,
+    seen: store,
+    registry,
+    conversations,
+    probe: probeMailbox,
+    answer: (id, text) => sender.answerCallbackQuery(id, text),
+    edit: (messageId, html, keyboard) =>
+      sender.editMessageText(operatorChatId, messageId, html, keyboard),
+    reply: async (html, keyboard) => {
+      await sender.send(html, keyboard);
+    },
+    now: () => Date.now(),
+  };
+
+  const commandDeps: CommandDeps = {
+    operatorChatId,
+    mailboxes,
+    seen: store,
+    registry,
+    conversations,
+    probe: probeMailbox,
+    reply: async (html: string, keyboard?: InlineKeyboard) => {
+      // commands.ts deliberately emits no markup, but TelegramSender always
+      // sends with parse_mode: 'HTML' — a label or hostname containing '<'
+      // or '&' would otherwise produce a Telegram 400. The keyboard argument
+      // must be forwarded, not dropped, or the add wizard's host quick-picks
+      // (which flow through this same reply) would never render.
+      await sender.send(escapeHtml(html), keyboard);
+    },
+    deleteMessage: (messageId: number) => sender.deleteMessage(operatorChatId, messageId),
+    now: () => Date.now(),
+    menu: () => renderMenu(callbackDeps),
+  };
+
   started = await startDaemon({
     healthPort: config.healthPort,
     states: () => registry.states(),
@@ -576,23 +617,12 @@ async function main(): Promise<void> {
       runReceiver({
         token: config.telegramBotToken,
         signal: receiverAbort.signal,
-        onUpdate: (update) =>
-          handleUpdate(update, {
-            operatorChatId,
-            mailboxes,
-            seen: store,
-            registry,
-            conversations,
-            probe: probeMailbox,
-            reply: async (text) => {
-              // commands.ts deliberately emits no markup, but TelegramSender
-              // always sends with parse_mode: 'HTML' — a label or hostname
-              // containing '<' or '&' would otherwise produce a Telegram 400.
-              await sender.send(escapeHtml(text));
-            },
-            deleteMessage: (messageId) => sender.deleteMessage(operatorChatId, messageId),
-            now: () => Date.now(),
-          }),
+        onUpdate: (update) => {
+          if (update.callback_query !== undefined) {
+            return handleCallback(update, callbackDeps);
+          }
+          return handleUpdate(update, commandDeps);
+        },
       }).catch((err: unknown) => {
         onReceiverStopped(err, {
           // Same clean-shutdown sequence a SIGTERM gets, but exiting 1.

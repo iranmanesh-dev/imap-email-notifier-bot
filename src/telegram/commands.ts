@@ -21,6 +21,9 @@ export type CommandDeps = {
   reply: (text: string, keyboard?: InlineKeyboard) => Promise<void>;
   deleteMessage: (messageId: number) => Promise<boolean>;
   now: () => number;
+  // Optional so all pre-existing callers/tests (which pass none) keep
+  // working unchanged. Renders the button menu for /start, /help and /menu.
+  menu?: () => Promise<void>;
 };
 
 const USAGE = [
@@ -131,6 +134,8 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
       return testMailbox(args, deps);
     case '/start':
     case '/help':
+    case '/menu':
+      if (deps.menu !== undefined) await deps.menu();
       return deps.reply(USAGE);
     default:
       return deps.reply(`Unknown command.\n\n${USAGE}`);

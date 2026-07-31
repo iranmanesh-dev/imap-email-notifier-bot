@@ -248,3 +248,69 @@ describe('add wizard', () => {
     expect(restored).toMatchObject({ kind: 'wizard-host', label: 'Work' });
   });
 });
+
+describe('remove and test', () => {
+  function seed(deps: CallbackDeps, label: string) {
+    deps.mailboxes.add({ label, host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+  }
+
+  it('picking a mailbox asks for confirmation and deletes nothing yet', async () => {
+    const { deps, edits, stored } = makeDeps();
+    seed(deps, 'Work');
+    await handleCallback(tap(encodeAction({ kind: 'remove', token: labelToken('Work') })), deps);
+    expect(edits.at(-1)).toMatch(/remove/i);
+    expect(stored.size).toBe(1);
+  });
+
+  it('confirming removes the mailbox, stops the watcher and purges state', async () => {
+    const { deps, stored, running, edits } = makeDeps();
+    seed(deps, 'Work');
+    await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Work') })), deps);
+
+    expect(stored.size).toBe(0);
+    expect(running.has('Work')).toBe(false);
+    expect(deps.seen.purgeAccount).toHaveBeenCalledWith('Work');
+    expect(edits.at(-1)).toMatch(/removed/i);
+  });
+
+  it('a stale remove token reports the mailbox is gone and acts on nothing', async () => {
+    const { deps, stored, edits } = makeDeps();
+    seed(deps, 'Work');
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Deleted') })), deps);
+    expect(stored.size).toBe(1);
+    expect(edits.at(-1)).toMatch(/no longer exists|not found/i);
+  });
+
+  it('a stale token never purges another account', async () => {
+    const { deps } = makeDeps();
+    seed(deps, 'Work');
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Ghost') })), deps);
+    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
+  });
+
+  it('test runs the probe and reports success', async () => {
+    const { deps, edits, probes } = makeDeps();
+    seed(deps, 'Work');
+    await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Work') })), deps);
+    expect(probes).toEqual(['Work']);
+    expect(edits.at(-1)).toMatch(/4 folders/i);
+  });
+
+  it('test reports a failure without leaking the password', async () => {
+    const { deps, edits } = makeDeps({
+      probe: async () => ({ ok: false, reason: 'login failed for u with hunter2' }),
+    });
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'hunter2', secure: true });
+    await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Work') })), deps);
+    expect(edits.at(-1)).not.toContain('hunter2');
+  });
+
+  it('a stale test token reports the mailbox is gone', async () => {
+    const { deps, edits, probes } = makeDeps();
+    await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Ghost') })), deps);
+    expect(probes).toEqual([]);
+    expect(edits.at(-1)).toMatch(/no longer exists|not found/i);
+  });
+});
