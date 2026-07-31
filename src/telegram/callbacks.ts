@@ -170,10 +170,58 @@ async function doRemove(
   const label = await resolveOrReport(deps, messageId, token);
   if (label === null) return;
 
-  await deps.registry.remove(label);
-  deps.mailboxes.remove(label);
-  deps.seen.purgeAccount(label);
-  await show(deps, messageId, `Removed <b>${escapeHtml(label)}</b> and stopped watching it.`, menuKeyboard());
+  // No stop-failure branch here on purpose, mirroring commands.ts's
+  // completeRemove: WatcherRegistry.remove() deregisters the watcher first
+  // and swallows any stop() failure internally, so it cannot report one —
+  // and it should not: the watcher is already gone from the registry by
+  // then, so refusing to delete the credentials because a logout failed
+  // would leave the operator with a mailbox that is no longer watched but
+  // still stored. The boolean distinguishes "stopped a running watcher"
+  // from "there was nothing to stop", so the final message can be truthful.
+  const wasWatched = await deps.registry.remove(label);
+
+  try {
+    deps.mailboxes.remove(label);
+  } catch (err) {
+    // The watcher is already stopped at this point, but the credentials and
+    // seen-state are both still there. A bare "Removed" here would be a
+    // lie — the mailbox is still stored and (from the operator's view still
+    // "configured") — and silence via handleCallback's catch would be
+    // indistinguishable from success.
+    return show(
+      deps,
+      messageId,
+      `Stopped watching <b>${escapeHtml(label)}</b>, but failed to remove its stored ` +
+        `credentials: ${escapeHtml(errorText(err))}\nIts notification history was not purged ` +
+        `either. You may need to remove it manually.`,
+      backKeyboard()
+    );
+  }
+
+  try {
+    deps.seen.purgeAccount(label);
+  } catch (err) {
+    // Credentials ARE gone here — only the seen-state purge failed. A later
+    // re-add would otherwise silently inherit the old high-water mark and
+    // suppress notifications the operator expects to see from a "fresh"
+    // mailbox.
+    return show(
+      deps,
+      messageId,
+      `Removed <b>${escapeHtml(label)}</b> and stopped watching it, but failed to purge its ` +
+        `notification history: ${escapeHtml(errorText(err))}`,
+      backKeyboard()
+    );
+  }
+
+  await show(
+    deps,
+    messageId,
+    wasWatched
+      ? `Removed <b>${escapeHtml(label)}</b> and stopped watching it.`
+      : `Removed <b>${escapeHtml(label)}</b>. It was not being watched, so there was nothing to stop.`,
+    menuKeyboard()
+  );
 }
 
 async function doTest(
@@ -189,8 +237,17 @@ async function doTest(
     account = deps.mailboxes.get(label);
   } catch (err) {
     // Decryption can fail if MASTER_KEY changed. Report it — silence here is
-    // indistinguishable from "mail stopped arriving".
-    return show(deps, messageId, `Could not read <b>${escapeHtml(label)}</b>: ${escapeHtml(errorText(err))}`, backKeyboard());
+    // indistinguishable from "mail stopped arriving" — and give the same
+    // recovery hint commands.ts's testMailbox gives: this is the message
+    // someone sees precisely when they are trying to diagnose this exact
+    // situation.
+    return show(
+      deps,
+      messageId,
+      `Could not read <b>${escapeHtml(label)}</b>: ${escapeHtml(errorText(err))}\n` +
+        `If MASTER_KEY changed, that mailbox can no longer be decrypted — remove it and add it again.`,
+      backKeyboard()
+    );
   }
   if (account === null) {
     return show(deps, messageId, 'That mailbox no longer exists.', menuKeyboard());

@@ -1,8 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { handleCallback, type CallbackDeps } from '../src/telegram/callbacks.js';
 import { Conversations } from '../src/telegram/conversation.js';
-import { encodeAction, labelToken } from '../src/telegram/keyboards.js';
+import { decodeAction, encodeAction, labelToken } from '../src/telegram/keyboards.js';
 import type { TelegramUpdate } from '../src/telegram/receiver.js';
+import type { InlineKeyboard } from '../src/telegram/sender.js';
 import type { Account } from '../src/types.js';
 
 const OPERATOR = 42;
@@ -25,7 +26,9 @@ function makeDeps(overrides: Partial<CallbackDeps> = {}) {
   const running = new Set<string>();
   const answers: [string, string | undefined][] = [];
   const edits: string[] = [];
+  const editKeyboards: (InlineKeyboard | undefined)[] = [];
   const replies: string[] = [];
+  const replyKeyboards: (InlineKeyboard | undefined)[] = [];
   const probes: string[] = [];
 
   const deps: CallbackDeps = {
@@ -50,12 +53,24 @@ function makeDeps(overrides: Partial<CallbackDeps> = {}) {
     conversations: new Conversations(),
     probe: async (a: Account) => { probes.push(a.label); return { ok: true, folders: 4 }; },
     answer: async (id: string, text?: string) => { answers.push([id, text]); return true; },
-    edit: async (_id: number, html: string) => { edits.push(html); return true; },
-    reply: async (html: string) => { replies.push(html); },
+    edit: async (_id: number, html: string, keyboard?: InlineKeyboard) => {
+      edits.push(html);
+      editKeyboards.push(keyboard);
+      return true;
+    },
+    reply: async (html: string, keyboard?: InlineKeyboard) => {
+      replies.push(html);
+      replyKeyboards.push(keyboard);
+    },
     now: () => NOW,
     ...overrides,
   };
-  return { deps, answers, edits, replies, stored, running, probes };
+  return { deps, answers, edits, editKeyboards, replies, replyKeyboards, stored, running, probes };
+}
+
+/** Decodes every button in a keyboard, for asserting on actions rather than raw encoded strings. */
+function actionsIn(keyboard: InlineKeyboard | undefined) {
+  return (keyboard ?? []).flat().map((b) => decodeAction(b.callback_data));
 }
 
 describe('authorization', () => {
@@ -255,15 +270,21 @@ describe('remove and test', () => {
   }
 
   it('picking a mailbox asks for confirmation and deletes nothing yet', async () => {
-    const { deps, edits, stored } = makeDeps();
+    const { deps, edits, editKeyboards, stored } = makeDeps();
     seed(deps, 'Work');
-    await handleCallback(tap(encodeAction({ kind: 'remove', token: labelToken('Work') })), deps);
+    const token = labelToken('Work');
+    await handleCallback(tap(encodeAction({ kind: 'remove', token })), deps);
     expect(edits.at(-1)).toMatch(/remove/i);
     expect(stored.size).toBe(1);
+    // The whole point of this screen is a real confirm button carrying the
+    // SAME token — asserting on decoded actions rather than the raw html
+    // means a keyboard that silently reverted to the menu (leaving the
+    // operator no way to confirm) cannot pass by matching on text alone.
+    expect(actionsIn(editKeyboards.at(-1))).toContainEqual({ kind: 'remove-confirm', token });
   });
 
   it('confirming removes the mailbox, stops the watcher and purges state', async () => {
-    const { deps, stored, running, edits } = makeDeps();
+    const { deps, stored, running, edits, editKeyboards } = makeDeps();
     seed(deps, 'Work');
     await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
 
@@ -273,6 +294,16 @@ describe('remove and test', () => {
     expect(running.has('Work')).toBe(false);
     expect(deps.seen.purgeAccount).toHaveBeenCalledWith('Work');
     expect(edits.at(-1)).toMatch(/removed/i);
+    expect(actionsIn(editKeyboards.at(-1))).toContainEqual({ kind: 'add' });
+  });
+
+  it('removing a mailbox that was never watched says so instead of overclaiming', async () => {
+    const { deps, edits, running } = makeDeps();
+    seed(deps, 'Work');
+    // Deliberately not added to the registry.
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Work') })), deps);
+    expect(running.has('Work')).toBe(false);
+    expect(edits.at(-1)).toMatch(/not being watched|nothing to stop/i);
   });
 
   it('a stale remove token reports the mailbox is gone and acts on nothing', async () => {
@@ -290,12 +321,57 @@ describe('remove and test', () => {
     expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
   });
 
+  it('a mailbox store failure removing credentials is reported, not silently swallowed', async () => {
+    const { deps, edits } = makeDeps();
+    seed(deps, 'Work');
+    deps.mailboxes.remove = () => {
+      throw new Error('database is locked');
+    };
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Work') })), deps);
+    // The watcher IS stopped by this point (registry.remove ran first) but
+    // the credentials are still stored — a bare "Removed" would be a lie,
+    // and silence would leave the operator believing it is gone.
+    expect(edits.at(-1)).toMatch(/database is locked/);
+    expect(edits.at(-1)).toMatch(/credentials/i);
+    expect(edits.at(-1)).not.toMatch(/^removed/i);
+  });
+
+  it('a seen-store purge failure after a successful remove is reported, not silently swallowed', async () => {
+    const { deps, edits, stored } = makeDeps();
+    seed(deps, 'Work');
+    deps.seen.purgeAccount = vi.fn(() => {
+      throw new Error('purge failed');
+    });
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Work') })), deps);
+    // The credentials ARE gone here — only the seen-state purge failed — so
+    // the reply must say both things truthfully rather than picking one.
+    expect(stored.size).toBe(0);
+    expect(edits.at(-1)).toMatch(/removed/i);
+    expect(edits.at(-1)).toMatch(/purge failed/);
+    expect(edits.at(-1)).toMatch(/notification history/i);
+  });
+
+  it('the remove picker offers exactly one button per mailbox, each with its own token', async () => {
+    const { deps, editKeyboards } = makeDeps();
+    seed(deps, 'Work');
+    seed(deps, 'Home');
+    await handleCallback(tap('rp'), deps);
+    const removeActions = actionsIn(editKeyboards.at(-1)).filter((a) => a?.kind === 'remove');
+    expect(removeActions).toHaveLength(2);
+    expect(removeActions.map((a) => (a as { token: string }).token).sort()).toEqual(
+      [labelToken('Home'), labelToken('Work')].sort()
+    );
+  });
+
   it('test runs the probe and reports success', async () => {
-    const { deps, edits, probes } = makeDeps();
+    const { deps, edits, editKeyboards, probes } = makeDeps();
     seed(deps, 'Work');
     await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Work') })), deps);
     expect(probes).toEqual(['Work']);
     expect(edits.at(-1)).toMatch(/4 folders/i);
+    // A terminal result screen must offer a way back to the menu — otherwise
+    // the operator is stuck once they have read it.
+    expect(actionsIn(editKeyboards.at(-1))).toContainEqual({ kind: 'menu' });
   });
 
   it('test reports a failure without leaking the password', async () => {
@@ -312,5 +388,18 @@ describe('remove and test', () => {
     await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Ghost') })), deps);
     expect(probes).toEqual([]);
     expect(edits.at(-1)).toMatch(/no longer exists|not found/i);
+  });
+
+  it('a decrypt failure on test includes the MASTER_KEY recovery hint', async () => {
+    const { deps, edits, editKeyboards } = makeDeps();
+    seed(deps, 'Work');
+    deps.mailboxes.get = () => {
+      throw new Error('bad auth tag');
+    };
+    await handleCallback(tap(encodeAction({ kind: 'test', token: labelToken('Work') })), deps);
+    expect(edits.at(-1)).toMatch(/bad auth tag/);
+    expect(edits.at(-1)).toMatch(/MASTER_KEY/);
+    expect(edits.at(-1)).toMatch(/remove it and add it again/i);
+    expect(actionsIn(editKeyboards.at(-1))).toContainEqual({ kind: 'menu' });
   });
 });
