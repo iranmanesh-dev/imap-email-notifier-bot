@@ -63,7 +63,24 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
         // Without it the operator walks all five steps, sends a password,
         // has it deleted and a real IMAP login run — and only then does
         // mailboxes.add throw "already exists", with nothing saved.
-        if (deps.mailboxes.labels().includes(text)) {
+        // `take()` above already consumed the pending entry, so an unguarded
+        // throw here would leave the operator with no reply AND no wizard
+        // step to continue from — the flow would simply die mid-way with a
+        // silent Telegram. Restore the step on failure and say so.
+        let existing: string[];
+        try {
+          existing = deps.mailboxes.labels();
+        } catch (err) {
+          deps.conversations.set(message.chat.id, {
+            kind: 'wizard-label', expiresAt: deps.now() + WIZARD_TTL_MS,
+          });
+          return deps.reply(
+            `Could not read the saved mailboxes to check that label: ${errorText(err)}\n` +
+              `Send the label again to retry.`,
+            cancelKeyboard()
+          );
+        }
+        if (existing.includes(text)) {
           // Stay on the label step so another label can simply be sent.
           deps.conversations.set(message.chat.id, {
             kind: 'wizard-label', expiresAt: deps.now() + WIZARD_TTL_MS,

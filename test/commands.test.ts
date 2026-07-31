@@ -501,6 +501,35 @@ describe('wizard typed steps', () => {
     expect(keyboards.at(-1)).toEqual(hostPickKeyboard());
   });
 
+  it('a failing labels() lookup replies and keeps the wizard on the label step', async () => {
+    const { deps, replies } = makeDeps();
+    vi.spyOn(deps.mailboxes, 'labels').mockImplementation(() => {
+      throw new Error('database is locked');
+    });
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+
+    // Must not throw: `take()` has already consumed the pending entry, so an
+    // escaping error would leave the operator with no reply and no step.
+    await expect(handleUpdate(msg('Work'), deps)).resolves.toBeUndefined();
+
+    expect(replies.at(-1)).toContain('database is locked');
+    // Still on the label step, so retrying is just sending the label again.
+    expect(deps.conversations.take(OPERATOR, NOW)?.kind).toBe('wizard-label');
+  });
+
+  it('recovers to the host step once labels() works again', async () => {
+    const { deps, replies } = makeDeps();
+    const labels = vi.spyOn(deps.mailboxes, 'labels').mockImplementationOnce(() => {
+      throw new Error('database is locked');
+    });
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('Work'), deps);
+    await handleUpdate(msg('Work'), deps);
+
+    expect(labels).toHaveBeenCalledTimes(2);
+    expect(replies.at(-1)).toMatch(/host/i);
+  });
+
   it('a typed host advances to the port step', async () => {
     const { deps, replies } = makeDeps();
     deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
