@@ -4,9 +4,17 @@ export type TelegramMessage = {
   text?: string;
 };
 
+export type TelegramCallbackQuery = {
+  id: string;
+  from: { id: number };
+  data?: string;
+  message?: { message_id: number; chat: { id: number } };
+};
+
 export type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 };
 
 export type ReceiverOptions = {
@@ -40,12 +48,27 @@ function redact(text: string, token: string): string {
   return text.split(token).join('***');
 }
 
+function isValidCallbackQuery(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const cb = value as { id?: unknown };
+  return typeof cb.id === 'string' && cb.id.length > 0;
+}
+
 function isValidUpdate(value: unknown): value is TelegramUpdate {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    Number.isInteger((value as { update_id?: unknown }).update_id)
-  );
+  if (
+    typeof value !== 'object' ||
+    value === null ||
+    !Number.isInteger((value as { update_id?: unknown }).update_id)
+  ) {
+    return false;
+  }
+
+  const update = value as { callback_query?: unknown };
+  if (update.callback_query !== undefined && !isValidCallbackQuery(update.callback_query)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
