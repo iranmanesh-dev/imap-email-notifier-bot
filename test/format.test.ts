@@ -8,7 +8,7 @@ function makeEmail(overrides: Partial<NormalizedEmail> = {}): NormalizedEmail {
     accountLabel: 'Work',
     mailboxAddress: 'me@work.example',
     folder: 'INBOX',
-    from: 'alice@example.com',
+    from: 'Alice Smith <alice@example.com>',
     subject: 'Hello there',
     preview: 'Just checking in.',
     date: new Date('2026-07-28T10:00:00Z'),
@@ -72,11 +72,22 @@ describe('formatEmail', () => {
     expect(out).toBe(
       '#Work\n' +
         '#INBOX\n' +
-        'from: alice@example.com\n' +
+        'from: Alice Smith &lt;alice@example.com&gt;\n' +
         'to: me@work.example\n' +
         'subject: Hello there\n' +
         'Just checking in.'
     );
+  });
+
+  it('shows the sender name alongside the address', () => {
+    const out = formatEmail(makeEmail({ from: 'Alice Smith <alice@example.com>' }));
+    expect(out).toContain('Alice Smith');
+    expect(out).toContain('alice@example.com');
+  });
+
+  it('shows a bare address unchanged when there is no display name', () => {
+    const out = formatEmail(makeEmail({ from: 'alice@example.com' }));
+    expect(out).toContain('\nfrom: alice@example.com\n');
   });
 
   it('hashtags the mailbox label and the folder on separate lines', () => {

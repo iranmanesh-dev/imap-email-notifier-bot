@@ -23,10 +23,9 @@ describe('parseEmail', () => {
     expect(email.preview).toContain('free for lunch tomorrow');
   });
 
-  it('extracts the bare sender address, dropping the display name', async () => {
+  it('keeps both the sender display name and the address', async () => {
     const email = await parseEmail(fixture('plain.eml'), ctx);
-    expect(email.from).toBe('alice@example.com');
-    expect(email.from).not.toContain('Alice Smith');
+    expect(email.from).toBe('Alice Smith <alice@example.com>');
   });
 
   it('carries the account label, mailbox address and folder through', async () => {
@@ -68,12 +67,10 @@ describe('parseEmail', () => {
   it('decodes RFC 2047 encoded-word subjects in a non-UTF-8 charset', async () => {
     const email = await parseEmail(fixture('latin1.eml'), ctx);
     expect(email.subject).toBe('Déjeuner à midi?');
-    // The From: header here is an encoded-word display name wrapping a plain
-    // address. We keep the address and drop the name by design, so decoding
-    // is asserted on the subject above; what matters here is that an
-    // encoded-word From: still yields the address rather than mojibake or
-    // the raw `=?iso-8859-1?Q?...?=` token.
-    expect(email.from).toBe('rene@example.com');
+    // The display name here is itself an encoded word, so it must decode
+    // rather than surface as mojibake or a raw `=?iso-8859-1?Q?...?=` token.
+    expect(email.from).toContain('René Müller');
+    expect(email.from).toContain('rene@example.com');
   });
 
   it('decodes a quoted-printable ISO-8859-1 body', async () => {

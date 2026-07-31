@@ -22,7 +22,7 @@ Hostinger and a real IMAP server in CI:
 ```
 #Work_Mail
 #Gmail_All_Mail
-from: alice@example.com
+from: Alice Smith <alice@example.com>
 to: me@example.com
 subject: Invoice #1042 due Friday
 Hi, please find attached the invoice for July. Let me know if anything looks off.
@@ -35,8 +35,9 @@ digit or underscore, so names are joined with underscores — `Work Mail` become
 
 `to:` is the address you configured for that mailbox, not the message's `To:` header —
 mail reaching you via an alias, a BCC or a forward still shows which of your mailboxes
-received it. `from:` is the sender's address; the display name is deliberately dropped,
-since it is attacker-controlled and routinely spoofs a different address.
+received it. `from:` shows the sender's display name *and* address: the name identifies
+the sender at a glance, and keeping the address beside it is what makes a spoofed name
+(`Your Bank <evil@attacker.example>`) visible rather than convincing.
 
 ### How it works
 

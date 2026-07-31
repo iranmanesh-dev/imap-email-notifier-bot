@@ -1,4 +1,4 @@
-import { simpleParser } from 'mailparser';
+import { simpleParser, type ParsedMail } from 'mailparser';
 import { createHash } from 'node:crypto';
 import type { NormalizedEmail } from '../types.js';
 
@@ -62,17 +62,37 @@ function syntheticId(source: Buffer, accountLabel: string): string {
   return `synthetic:${hash}`;
 }
 
+/**
+ * Renders the From: header as "Name <address>".
+ *
+ * Both parts are shown on purpose: the name is what identifies a sender at
+ * a glance, and keeping the address beside it is what makes a spoofed name
+ * (`Your Bank <evil@attacker.example>`) visible rather than convincing.
+ *
+ * Built from the parsed address list rather than taken from `from.text`,
+ * which quotes the display name (`"Alice Smith" <alice@example.com>`) —
+ * correct for a mail header, but noise in a notification. Falls back to
+ * `from.text` only when nothing parsed out of the header at all.
+ */
+function formatSender(from: ParsedMail['from']): string {
+  const parts = (from?.value ?? [])
+    .map((addr) => {
+      const name = addr.name?.trim() ?? '';
+      const address = addr.address?.trim() ?? '';
+      if (name.length > 0 && address.length > 0) return `${name} <${address}>`;
+      return address.length > 0 ? address : name;
+    })
+    .filter((part) => part.length > 0);
+
+  if (parts.length > 0) return parts.join(', ');
+  return from?.text?.trim() || '(unknown sender)';
+}
+
 export async function parseEmail(source: Buffer, ctx: ParseContext): Promise<NormalizedEmail> {
   const parsed = await simpleParser(source, { skipHtmlToText: true });
 
   const subject = parsed.subject ?? '';
-  // Prefer the bare address over `from.text` ("Alice <alice@example.com>"),
-  // because the notification shows a sender *address*. A display name is
-  // attacker-controlled and routinely spoofs a different address; the
-  // address is the part worth showing. Fall back to the full text only
-  // when the header is malformed enough that no address parsed out of it.
-  const from =
-    parsed.from?.value?.[0]?.address?.trim() || parsed.from?.text?.trim() || '(unknown sender)';
+  const from = formatSender(parsed.from);
   const date = parsed.date ?? new Date();
 
   const body = parsed.text || (parsed.html ? stripHtml(parsed.html) : '');
