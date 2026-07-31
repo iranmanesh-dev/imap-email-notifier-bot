@@ -50,9 +50,10 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
     if (!text.startsWith('/')) {
       if (pending.kind === 'password') {
         await completeAdd(pending, text, message.message_id, deps);
-      } else {
+      } else if (pending.kind === 'remove-confirm') {
         await completeRemove(pending.label, text, deps);
       }
+      // Wizard states are handled by their own message handlers (Tasks 5-7)
       return;
     }
     // A `/`-prefixed message during a pending flow must be treated as a
@@ -60,8 +61,11 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
     // mid-flow would be stored as a password or a removal confirmation.
     // The pending state is already discarded (take() is single-use); tell
     // the operator so they can't mistake this for "password accepted".
-    const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
-    await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
+    if (pending.kind === 'password' || pending.kind === 'remove-confirm') {
+      const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
+      await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
+    }
+    // Wizard states will log their own cancellation in their handlers
   }
 
   const [command, ...args] = text.split(/\s+/);
