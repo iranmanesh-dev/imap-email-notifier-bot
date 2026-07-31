@@ -1,4 +1,6 @@
-import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, type Conversations } from './conversation.js';
+import {
+  CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, cancellationNotice, type Conversations,
+} from './conversation.js';
 import { hostPickKeyboard } from './keyboards.js';
 import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
@@ -107,17 +109,9 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
     // mid-flow would be stored as a password or a removal confirmation.
     // The pending state is already discarded (take() is single-use); tell
     // the operator so they can't mistake this for "password accepted".
-    if (pending.kind === 'password' || pending.kind === 'remove-confirm') {
-      const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
-      await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
-    } else if (
-      pending.kind === 'wizard-label' ||
-      pending.kind === 'wizard-host' ||
-      pending.kind === 'wizard-port' ||
-      pending.kind === 'wizard-username'
-    ) {
-      await deps.reply('Cancelled the pending mailbox setup.');
-    }
+    // The wording lives in conversation.ts because handleCallback applies
+    // the identical rule to a button tap arriving mid-flow.
+    await deps.reply(cancellationNotice(pending));
   }
 
   const [command, ...args] = text.split(/\s+/);

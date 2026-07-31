@@ -1,6 +1,9 @@
 import { describe, it, expect, vi } from 'vitest';
 import { handleCallback, type CallbackDeps } from '../src/telegram/callbacks.js';
-import { Conversations } from '../src/telegram/conversation.js';
+import { handleUpdate, type CommandDeps } from '../src/telegram/commands.js';
+import {
+  CONFIRM_TTL_MS, Conversations, PASSWORD_TTL_MS,
+} from '../src/telegram/conversation.js';
 import { decodeAction, encodeAction, labelToken } from '../src/telegram/keyboards.js';
 import type { TelegramUpdate } from '../src/telegram/receiver.js';
 import type { InlineKeyboard } from '../src/telegram/sender.js';
@@ -66,6 +69,36 @@ function makeDeps(overrides: Partial<CallbackDeps> = {}) {
     ...overrides,
   };
   return { deps, answers, edits, editKeyboards, replies, replyKeyboards, stored, running, probes };
+}
+
+function typed(text: string, messageId = 77): TelegramUpdate {
+  return { update_id: 2, message: { message_id: messageId, chat: { id: OPERATOR }, text } };
+}
+
+/**
+ * A CommandDeps sharing the SAME Conversations instance as a CallbackDeps.
+ *
+ * The two inbound surfaces are the only two writers of conversation state,
+ * and the defect this covers lives exactly in the seam between them: what a
+ * button tap leaves behind is read back by the TYPED handler. Nothing that
+ * exercises only one surface can see it.
+ */
+function makeCommandDeps(deps: CallbackDeps) {
+  const replies: string[] = [];
+  const deleted: number[] = [];
+  const probes: string[] = [];
+  const commandDeps: CommandDeps = {
+    operatorChatId: deps.operatorChatId,
+    mailboxes: deps.mailboxes,
+    seen: deps.seen,
+    registry: deps.registry,
+    conversations: deps.conversations,
+    probe: async (a: Account) => { probes.push(a.label); return { ok: true, folders: 1 }; },
+    reply: async (t: string) => { replies.push(t); },
+    deleteMessage: async (id: number) => { deleted.push(id); return true; },
+    now: () => NOW,
+  };
+  return { commandDeps, replies, deleted, probes };
 }
 
 /** Decodes every button in a keyboard, for asserting on actions rather than raw encoded strings. */
@@ -309,6 +342,110 @@ describe('add wizard', () => {
     const restored = deps.conversations.take(OPERATOR, NOW);
     expect(restored?.kind).toBe('wizard-host');
     expect(restored).toMatchObject({ kind: 'wizard-host', label: 'Work' });
+  });
+});
+
+describe('a button tap arriving mid-flow', () => {
+  it('cancels a pending password prompt with a notice AND really disarms it', async () => {
+    const { deps, replies } = makeDeps();
+    const { commandDeps, deleted, probes } = makeCommandDeps(deps);
+    deps.conversations.set(OPERATOR, {
+      kind: 'password', label: 'Work', host: 'imap.gmail.com', port: 993,
+      username: 'me@gmail.com', expiresAt: NOW + PASSWORD_TTL_MS,
+    });
+
+    await handleCallback(tap('l'), deps);
+
+    expect(replies.some((r) => /cancel/i.test(r) && /Work/.test(r))).toBe(true);
+
+    // The assertion that actually matters. A test checking only the notice
+    // would miss the point: the danger is that the pending entry survives,
+    // so the operator's NEXT ordinary message is irreversibly deleted from
+    // Telegram and transmitted as a password in a real IMAP LOGIN to
+    // imap.gmail.com, landing in a third party's auth-failure logs.
+    await handleUpdate(typed('just chatting'), commandDeps);
+    expect(deleted).toEqual([]);
+    expect(probes).toEqual([]);
+    expect(deps.conversations.size()).toBe(0);
+  });
+
+  it('cancels a pending removal confirmation, so a later "yes" cannot delete the mailbox', async () => {
+    const { deps, replies, stored } = makeDeps();
+    const { commandDeps } = makeCommandDeps(deps);
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    deps.conversations.set(OPERATOR, {
+      kind: 'remove-confirm', label: 'Work', expiresAt: NOW + CONFIRM_TTL_MS,
+    });
+
+    await handleCallback(tap('s'), deps);
+    expect(replies.some((r) => /cancel/i.test(r) && /Work/.test(r))).toBe(true);
+
+    await handleUpdate(typed('yes'), commandDeps);
+    expect(stored.size).toBe(1);
+    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
+  });
+
+  it('cancels on an unrecognised callback too, not just on known actions', async () => {
+    const { deps, replies } = makeDeps();
+    const { commandDeps, deleted, probes } = makeCommandDeps(deps);
+    deps.conversations.set(OPERATOR, {
+      kind: 'password', label: 'Work', host: 'h', port: 993,
+      username: 'u', expiresAt: NOW + PASSWORD_TTL_MS,
+    });
+
+    await handleCallback(tap('zzz-not-an-action'), deps);
+
+    expect(replies.some((r) => /cancel/i.test(r))).toBe(true);
+    await handleUpdate(typed('just chatting'), commandDeps);
+    expect(deleted).toEqual([]);
+    expect(probes).toEqual([]);
+  });
+
+  it('uses the same notice wording the typed surface uses for the same interruption', async () => {
+    // Two surfaces, one rule. If commands.ts's wording is ever reworded,
+    // this fails rather than letting the two drift apart silently.
+    const { deps, replies } = makeDeps();
+    const { commandDeps, replies: typedReplies } = makeCommandDeps(deps);
+    const pending = {
+      kind: 'password' as const, label: 'Work', host: 'h', port: 993,
+      username: 'u', expiresAt: NOW + PASSWORD_TTL_MS,
+    };
+
+    deps.conversations.set(OPERATOR, pending);
+    await handleCallback(tap('l'), deps);
+
+    deps.conversations.set(OPERATOR, pending);
+    await handleUpdate(typed('/list'), commandDeps);
+
+    expect(replies[0]).toBe(typedReplies[0]);
+  });
+
+  it('escapes the label in the notice, since the button surface emits HTML', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, {
+      kind: 'remove-confirm', label: 'A<b>X', expiresAt: NOW + CONFIRM_TTL_MS,
+    });
+    await handleCallback(tap('l'), deps);
+    expect(replies[0]).toContain('&lt;b&gt;');
+    expect(replies[0]).not.toContain('<b>X');
+  });
+
+  it('says nothing when there was no pending flow to cancel', async () => {
+    const { deps, replies } = makeDeps();
+    await handleCallback(tap('l'), deps);
+    expect(replies).toEqual([]);
+  });
+
+  it('leaves the pending flow alone for the actions that manage it themselves', async () => {
+    // cancel clears deliberately; add deliberately restarts; the four wizard
+    // quick-picks consume and advance (or restore) their own step. Sweeping
+    // those into the shared rule would break the wizard it is protecting.
+    for (const data of ['c', 'a', 'h:imap.x.com', 'p:993', 'xh', 'xp']) {
+      const { deps, replies } = makeDeps();
+      deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'W', expiresAt: NOW + 60_000 });
+      await handleCallback(tap(data), deps);
+      expect(replies.filter((r) => /cancelled the pending/i.test(r))).toEqual([]);
+    }
   });
 });
 

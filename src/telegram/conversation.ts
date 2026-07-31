@@ -31,6 +31,32 @@ export type Pending =
     };
 
 /**
+ * The notice sent when a pending flow is discarded because the operator did
+ * something else instead.
+ *
+ * Both inbound surfaces write conversation state, and both must say the
+ * same thing when they throw an entry away: an operator who sees "Cancelled
+ * …" after a `/command` and silence after a button tap has no way to know
+ * the button tap disarmed anything. Living here rather than in either
+ * handler is what makes that structural instead of a coincidence.
+ *
+ * Returns plain text with no markup — a caller emitting HTML must escape it.
+ */
+export function cancellationNotice(pending: Pending): string {
+  switch (pending.kind) {
+    case 'password':
+      return `Cancelled the pending password prompt for "${pending.label}".`;
+    case 'remove-confirm':
+      return `Cancelled the pending removal confirmation for "${pending.label}".`;
+    case 'wizard-label':
+    case 'wizard-host':
+    case 'wizard-port':
+    case 'wizard-username':
+      return 'Cancelled the pending mailbox setup.';
+  }
+}
+
+/**
  * In-memory, single-use state for multi-step commands.
  *
  * Expiry is essential, not tidiness: without it an abandoned /add would

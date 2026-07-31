@@ -5,7 +5,7 @@ import {
 } from './keyboards.js';
 import type { InlineKeyboard } from './sender.js';
 import type { TelegramUpdate } from './receiver.js';
-import { WIZARD_TTL_MS, type Conversations } from './conversation.js';
+import { WIZARD_TTL_MS, cancellationNotice, type Conversations } from './conversation.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
 import type { WatcherRegistry } from '../imap/registry.js';
@@ -66,6 +66,7 @@ export async function handleCallback(update: TelegramUpdate, deps: CallbackDeps)
   const messageId = query.message?.message_id;
   try {
     const action = query.data === undefined ? null : decodeAction(query.data);
+    await cancelPendingUnlessOwned(action, deps);
     if (action === null) {
       await renderMenu(deps, messageId);
       return;
@@ -86,6 +87,59 @@ export async function handleCallback(update: TelegramUpdate, deps: CallbackDeps)
       // Answering is cosmetic and must never fail the surrounding handler.
     }
   }
+}
+
+/**
+ * Actions that take responsibility for the pending conversation themselves.
+ *
+ * `cancel` clears it deliberately, `add` deliberately restarts the wizard,
+ * and the four wizard quick-picks consume their own step (advancing it, or
+ * restoring it untouched when the tap was on a stale keyboard). Sweeping
+ * these into the blanket rule below would cancel the very flow they exist
+ * to drive.
+ */
+function ownsPendingFlow(action: CallbackAction | null): boolean {
+  if (action === null) return false;
+  switch (action.kind) {
+    case 'cancel':
+    case 'add':
+    case 'host':
+    case 'port':
+    case 'type-host':
+    case 'type-port':
+      return true;
+    default:
+      return false;
+  }
+}
+
+/**
+ * Applies the typed surface's interrupt rule to a button tap.
+ *
+ * commands.ts already treats a `/`-command arriving mid-flow as a
+ * deliberate change of subject: it discards the pending entry and says so.
+ * A button tap is the same signal from the same operator, but it used to
+ * leave `password` / `remove-confirm` / `wizard-*` fully armed while every
+ * visible cue said the context had moved on.
+ *
+ * The consequence was not cosmetic. With a `password` entry still pending,
+ * the operator's next ordinary message is irreversibly deleted from
+ * Telegram by completeAdd and transmitted as a password in a real IMAP
+ * LOGIN — landing in a third party's auth-failure logs. With
+ * `remove-confirm`, a stray "yes" deletes a mailbox and purges its history.
+ *
+ * The notice comes from conversation.ts so the two surfaces cannot drift,
+ * and is escaped here because this surface (unlike commands.ts) emits HTML
+ * that is not escaped again downstream.
+ */
+async function cancelPendingUnlessOwned(
+  action: CallbackAction | null,
+  deps: CallbackDeps
+): Promise<void> {
+  if (ownsPendingFlow(action)) return;
+  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  if (pending === null) return;
+  await deps.reply(escapeHtml(cancellationNotice(pending)));
 }
 
 async function dispatch(
