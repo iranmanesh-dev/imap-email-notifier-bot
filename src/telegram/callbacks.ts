@@ -114,9 +114,9 @@ async function dispatch(
     case 'port':
       return applyPort(deps, messageId, action.value);
     case 'type-host':
-      return show(deps, messageId, 'Send the IMAP host as your next message.', cancelKeyboard());
+      return promptTyped(deps, messageId, 'wizard-host', 'Send the IMAP host as your next message.');
     case 'type-port':
-      return show(deps, messageId, 'Send the port number as your next message.', cancelKeyboard());
+      return promptTyped(deps, messageId, 'wizard-port', 'Send the port number as your next message.');
     case 'remove':
       return confirmRemove(deps, messageId, action.token);
     case 'remove-confirm':
@@ -335,6 +335,36 @@ async function applyPort(
     `Port: <b>${port}</b>\n\nSend the username or email address for this mailbox.`,
     cancelKeyboard()
   );
+}
+
+/**
+ * Solicits a typed value for one wizard step — but only while that exact
+ * step is pending.
+ *
+ * A "Type it myself…" button is as tappable on a stale keyboard as any
+ * other, and the reply it invites is consumed by whatever step handleUpdate
+ * finds pending, not by the step the button belonged to. An operator who
+ * restarts the wizard (arming `wizard-host`), taps the OLD port keyboard's
+ * "Type it myself…" and dutifully sends `993` would otherwise have that
+ * number stored as the mailbox's *host*. Guarding here mirrors applyHost /
+ * applyPort, which were hardened against the same mismatch.
+ *
+ * The entry is restored before any branch: take() is single-use, so a stray
+ * tap must not be able to destroy a step the operator is genuinely in the
+ * middle of. It is restored unchanged rather than re-armed, so a tap cannot
+ * extend a flow's TTL either.
+ */
+async function promptTyped(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  step: 'wizard-host' | 'wizard-port',
+  prompt: string
+): Promise<void> {
+  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  if (pending === null) return renderMenu(deps, messageId);
+  deps.conversations.set(Number(deps.operatorChatId), pending);
+  if (pending.kind !== step) return renderMenu(deps, messageId);
+  await show(deps, messageId, prompt, cancelKeyboard());
 }
 
 async function showList(deps: CallbackDeps, messageId: number | undefined): Promise<void> {

@@ -231,6 +231,54 @@ describe('add wizard', () => {
     expect(deps.conversations.size()).toBe(1);
   });
 
+  it('type-port asks the operator to type a port and keeps the wizard pending', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'Work', host: 'h', expiresAt: NOW + 60_000 });
+    await handleCallback(tap('xp'), deps);
+    expect(edits.at(-1)).toMatch(/port/i);
+    expect(deps.conversations.size()).toBe(1);
+  });
+
+  it('type-host while the PORT step is pending refuses to solicit a host, and keeps the port step', async () => {
+    // The operator restarted the wizard, so wizard-host is pending, but an
+    // older message still shows the port keyboard. Soliciting "the port"
+    // there would have handleUpdate's wizard-host branch consume the number
+    // as the HOST — building a mailbox with host '993'.
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'Work', host: 'h', expiresAt: NOW + 60_000 });
+    await handleCallback(tap('xh'), deps);
+    expect(edits.at(-1)).not.toMatch(/send the imap host/i);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored).toMatchObject({ kind: 'wizard-port', label: 'Work', host: 'h' });
+  });
+
+  it('type-port while the HOST step is pending refuses to solicit a port, and keeps the host step', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+    await handleCallback(tap('xp'), deps);
+    expect(edits.at(-1)).not.toMatch(/send the port/i);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored).toMatchObject({ kind: 'wizard-host', label: 'Work' });
+  });
+
+  it('type-host with no wizard pending returns to the menu instead of inventing one', async () => {
+    const { deps, edits } = makeDeps();
+    await handleCallback(tap('xh'), deps);
+    expect(edits.at(-1)).not.toMatch(/send the imap host/i);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    expect(deps.conversations.size()).toBe(0);
+  });
+
+  it('type-port with no wizard pending returns to the menu instead of inventing one', async () => {
+    const { deps, edits } = makeDeps();
+    await handleCallback(tap('xp'), deps);
+    expect(edits.at(-1)).not.toMatch(/send the port/i);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    expect(deps.conversations.size()).toBe(0);
+  });
+
   it('a host pick with no wizard pending returns to the menu instead of guessing', async () => {
     const { deps, edits } = makeDeps();
     await handleCallback(tap(encodeAction({ kind: 'host', value: 'imap.x.com' })), deps);
