@@ -282,3 +282,84 @@ describe('runReceiver', () => {
     }
   });
 });
+
+describe('callback queries', () => {
+  function cbUpdate(id: number, data: string): TelegramUpdate {
+    return {
+      update_id: id,
+      callback_query: {
+        id: `cbq-${id}`,
+        from: { id: 42 },
+        data,
+        message: { message_id: id * 10, chat: { id: 42 } },
+      },
+    };
+  }
+
+  it('forwards a callback-only update to the handler', async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (url: string) =>
+      url.includes('deleteWebhook')
+        ? jsonResponse(200, { ok: true })
+        : okUpdates([cbUpdate(1, 'm')])) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 2, async (u) => {
+      if (u.callback_query?.data !== undefined) seen.push(u.callback_query.data);
+    });
+    expect(seen).toEqual(['m']);
+  });
+
+  it('advances the offset past a callback-only update', async () => {
+    const urls: string[] = [];
+    let poll = 0;
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+      urls.push(url);
+      poll += 1;
+      return okUpdates(poll === 1 ? [cbUpdate(9, 'm')] : []);
+    }) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 3, async () => {});
+    expect(urls[1]).toContain('offset=10');
+  });
+
+  it('skips a callback query with no id rather than forwarding it', async () => {
+    const seen: unknown[] = [];
+    const bad = { update_id: 1, callback_query: { from: { id: 42 }, data: 'm' } };
+    const fetchImpl = (async (url: string) =>
+      url.includes('deleteWebhook')
+        ? jsonResponse(200, { ok: true })
+        : okUpdates([bad as unknown as TelegramUpdate])) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 2, async (u) => { seen.push(u); });
+    expect(seen).toHaveLength(0);
+  });
+
+  it('advances the offset past an update with a valid id but an invalid callback_query, without forwarding it', async () => {
+    const urls: string[] = [];
+    const seen: unknown[] = [];
+    let poll = 0;
+    const badCbUpdate = { update_id: 9, callback_query: { from: { id: 42 }, data: 'm' } };
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+      urls.push(url);
+      poll += 1;
+      return poll === 1 ? okUpdates([badCbUpdate as unknown as TelegramUpdate]) : okUpdates([]);
+    }) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 3, async (u) => { seen.push(u); });
+    expect(urls[1]).toContain('offset=10');
+    expect(seen).toHaveLength(0);
+  });
+
+  it('still forwards ordinary message updates', async () => {
+    const seen: string[] = [];
+    const fetchImpl = (async (url: string) =>
+      url.includes('deleteWebhook')
+        ? jsonResponse(200, { ok: true })
+        : okUpdates([update(1, '/list')])) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 2, async (u) => { seen.push(u.message?.text ?? ''); });
+    expect(seen).toEqual(['/list']);
+  });
+});

@@ -1,5 +1,8 @@
 export type SendOutcome = 'sent' | 'dropped';
 
+export type InlineButton = { text: string; callback_data: string };
+export type InlineKeyboard = InlineButton[][];
+
 export type SenderOptions = {
   token: string;
   chatId: string;
@@ -41,8 +44,8 @@ export class TelegramSender {
   }
 
   /** Enqueues a message. Resolves once it is sent or definitively dropped. */
-  send(html: string): Promise<SendOutcome> {
-    const result = this.#queue.then(() => this.#sendNow(html));
+  send(html: string, keyboard?: InlineKeyboard): Promise<SendOutcome> {
+    const result = this.#queue.then(() => this.#sendNow(html, keyboard));
     // Keep the chain alive even if one send rejects unexpectedly.
     this.#queue = result.catch(() => undefined);
     return result;
@@ -56,13 +59,16 @@ export class TelegramSender {
     }
   }
 
-  async #post(text: string, useHtml: boolean): Promise<Response> {
+  async #post(text: string, useHtml: boolean, keyboard?: InlineKeyboard): Promise<Response> {
     const body: Record<string, unknown> = {
       chat_id: this.#chatId,
       text,
       disable_web_page_preview: true,
     };
     if (useHtml) body.parse_mode = 'HTML';
+    if (keyboard !== undefined) {
+      body.reply_markup = { inline_keyboard: keyboard };
+    }
 
     return this.#fetch(`${this.#baseUrl}/sendMessage`, {
       method: 'POST',
@@ -89,7 +95,73 @@ export class TelegramSender {
     }
   }
 
-  async #sendNow(html: string): Promise<SendOutcome> {
+  /**
+   * Answers a callback query. MUST be called for every button tap, on every
+   * path including failures, or the operator's Telegram client shows a
+   * spinner on the button until it times out.
+   *
+   * Returns false rather than throwing — a failed answer is cosmetic and
+   * must never abort the action the tap requested.
+   */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<boolean> {
+    const body: Record<string, unknown> = { callback_query_id: callbackQueryId };
+    if (text !== undefined) body.text = text;
+    try {
+      const res = await this.#fetch(`${this.#baseUrl}/answerCallbackQuery`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      return res.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * Edits a message in place, so a multi-step wizard does not leave one
+   * message per step in the chat.
+   *
+   * Returns false rather than throwing. Telegram refuses to edit messages
+   * older than 48 hours, so callers must fall back to sending a new message
+   * — otherwise tapping a button on a day-old menu silently does nothing.
+   *
+   * True means "the message now displays this content", which is why a
+   * "message is not modified" 400 counts as success: Telegram rejects a
+   * no-op edit, but the requested state IS the displayed state. Reporting
+   * false there sent the caller down the new-message fallback, so
+   * double-tapping Back appended a duplicate menu every time. This is the
+   * only place that can tell the two 400s apart.
+   */
+  async editMessageText(
+    chatId: string,
+    messageId: number,
+    html: string,
+    keyboard?: InlineKeyboard
+  ): Promise<boolean> {
+    const body: Record<string, unknown> = {
+      chat_id: chatId,
+      message_id: messageId,
+      text: html,
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+    };
+    if (keyboard !== undefined) body.reply_markup = { inline_keyboard: keyboard };
+    try {
+      const res = await this.#fetch(`${this.#baseUrl}/editMessageText`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (res.ok) return true;
+      const payload = (await res.json().catch(() => ({}))) as { description?: string };
+      return (payload.description ?? '').includes('message is not modified');
+    } catch {
+      return false;
+    }
+  }
+
+  async #sendNow(html: string, keyboard?: InlineKeyboard): Promise<SendOutcome> {
     let text = html;
     let useHtml = true;
     let plainRetryUsed = false;
@@ -99,7 +171,7 @@ export class TelegramSender {
 
       let res: Response;
       try {
-        res = await this.#post(text, useHtml);
+        res = await this.#post(text, useHtml, keyboard);
       } catch {
         if (attempt === this.#maxAttempts) return 'dropped';
         await this.#sleep(Math.min(2 ** attempt * 500, 30_000));

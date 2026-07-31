@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { Conversations, PASSWORD_TTL_MS, type Pending } from '../src/telegram/conversation.js';
+import { Conversations, PASSWORD_TTL_MS, WIZARD_TTL_MS, type Pending } from '../src/telegram/conversation.js';
 
 const NOW = 1_000_000;
 
@@ -65,5 +65,41 @@ describe('Conversations', () => {
     c.set(1, pwPending(NOW - 1));
     c.take(1, NOW);
     expect(c.size()).toBe(0);
+  });
+});
+
+describe('wizard states', () => {
+  it('stores and returns a label step', () => {
+    const c = new Conversations();
+    c.set(1, { kind: 'wizard-label', expiresAt: NOW + WIZARD_TTL_MS });
+    expect(c.take(1, NOW)).toEqual({ kind: 'wizard-label', expiresAt: NOW + WIZARD_TTL_MS });
+  });
+
+  it('carries collected fields forward through the steps', () => {
+    const c = new Conversations();
+    c.set(1, { kind: 'wizard-port', label: 'Work', host: 'imap.x.com', expiresAt: NOW + WIZARD_TTL_MS });
+    expect(c.take(1, NOW)).toMatchObject({ kind: 'wizard-port', label: 'Work', host: 'imap.x.com' });
+
+    c.set(1, { kind: 'wizard-username', label: 'Work', host: 'imap.x.com', port: 993, expiresAt: NOW + WIZARD_TTL_MS });
+    expect(c.take(1, NOW)).toMatchObject({ kind: 'wizard-username', port: 993 });
+  });
+
+  it('expires a wizard step like any other pending state', () => {
+    const c = new Conversations();
+    c.set(1, { kind: 'wizard-host', label: 'Work', expiresAt: NOW - 1 });
+    expect(c.take(1, NOW)).toBeNull();
+    expect(c.size()).toBe(0);
+  });
+
+  it('replacing a wizard step with the password step keeps one entry', () => {
+    const c = new Conversations();
+    c.set(1, { kind: 'wizard-username', label: 'Work', host: 'h', port: 993, expiresAt: NOW + WIZARD_TTL_MS });
+    c.set(1, { kind: 'password', label: 'Work', host: 'h', port: 993, username: 'u', expiresAt: NOW + WIZARD_TTL_MS });
+    expect(c.take(1, NOW)).toMatchObject({ kind: 'password', username: 'u' });
+    expect(c.size()).toBe(0);
+  });
+
+  it('WIZARD_TTL_MS matches the password prompt TTL', () => {
+    expect(WIZARD_TTL_MS).toBe(PASSWORD_TTL_MS);
   });
 });

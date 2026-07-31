@@ -4,9 +4,17 @@ export type TelegramMessage = {
   text?: string;
 };
 
+export type TelegramCallbackQuery = {
+  id: string;
+  from: { id: number };
+  data?: string;
+  message?: { message_id: number; chat: { id: number } };
+};
+
 export type TelegramUpdate = {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
 };
 
 export type ReceiverOptions = {
@@ -40,12 +48,37 @@ function redact(text: string, token: string): string {
   return text.split(token).join('***');
 }
 
-function isValidUpdate(value: unknown): value is TelegramUpdate {
+/**
+ * Checks only the `update_id`, independently of the rest of the payload. This
+ * is split out from `isValidUpdate` so the receiver loop can advance the
+ * offset as soon as the id is known to be real, even when some other part of
+ * the update (e.g. a malformed callback_query) makes the update unforwardable.
+ * A missing or non-integer update_id is the one case where there is truly
+ * nothing to advance to.
+ */
+function hasValidUpdateId(value: unknown): value is { update_id: number } {
   return (
     typeof value === 'object' &&
     value !== null &&
     Number.isInteger((value as { update_id?: unknown }).update_id)
   );
+}
+
+function isValidCallbackQuery(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const cb = value as { id?: unknown };
+  return typeof cb.id === 'string' && cb.id.length > 0;
+}
+
+function isValidUpdate(value: unknown): value is TelegramUpdate {
+  if (!hasValidUpdateId(value)) return false;
+
+  const update = value as { callback_query?: unknown };
+  if (update.callback_query !== undefined && !isValidCallbackQuery(update.callback_query)) {
+    return false;
+  }
+
+  return true;
 }
 
 /**
@@ -132,14 +165,24 @@ export async function runReceiver(opts: ReceiverOptions): Promise<void> {
     const updates = Array.isArray(rawResult) ? rawResult : [];
 
     for (const raw of updates) {
-      if (!isValidUpdate(raw)) {
+      if (!hasValidUpdateId(raw)) {
         logError('[telegram] skipping an update with a missing or invalid update_id');
         continue;
       }
-      // Advance past this update BEFORE handling it. A handler that throws
-      // must not make the same update replay forever — the command handler
-      // is responsible for reporting its own failures.
+      // Advance past this update_id BEFORE handling it, as soon as the id
+      // itself is known to be valid — not only once the whole payload
+      // validates. Otherwise an update rejected for an unrelated reason
+      // (e.g. a malformed callback_query) would keep its update_id below the
+      // offset and Telegram would redeliver it on every poll forever. A
+      // handler that throws must not cause a replay either — the command
+      // handler is responsible for reporting its own failures.
       offset = Math.max(offset, raw.update_id + 1);
+
+      if (!isValidUpdate(raw)) {
+        logError('[telegram] skipping an update with an invalid callback_query');
+        continue;
+      }
+
       try {
         await opts.onUpdate(raw);
       } catch (err) {

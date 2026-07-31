@@ -14,6 +14,8 @@ import { probeMailbox } from './imap/probe.js';
 import { Conversations } from './telegram/conversation.js';
 import { runReceiver, FatalTelegramError } from './telegram/receiver.js';
 import { handleUpdate } from './telegram/commands.js';
+import { handleCallback } from './telegram/callbacks.js';
+import { buildTelegramDeps } from './telegram/deps.js';
 import type { Account, NormalizedEmail } from './types.js';
 
 const PRUNE_AFTER_DAYS = 30;
@@ -569,6 +571,19 @@ async function main(): Promise<void> {
     });
   };
 
+  // Assembled by an exported, testable function rather than inline here:
+  // the two adapters differ only in whether they escape, and getting that
+  // backwards fails silently and totally. See buildTelegramDeps.
+  const { callbackDeps, commandDeps } = buildTelegramDeps({
+    sender,
+    operatorChatId,
+    mailboxes,
+    seen: store,
+    registry,
+    conversations,
+    probe: probeMailbox,
+  });
+
   started = await startDaemon({
     healthPort: config.healthPort,
     states: () => registry.states(),
@@ -576,23 +591,12 @@ async function main(): Promise<void> {
       runReceiver({
         token: config.telegramBotToken,
         signal: receiverAbort.signal,
-        onUpdate: (update) =>
-          handleUpdate(update, {
-            operatorChatId,
-            mailboxes,
-            seen: store,
-            registry,
-            conversations,
-            probe: probeMailbox,
-            reply: async (text) => {
-              // commands.ts deliberately emits no markup, but TelegramSender
-              // always sends with parse_mode: 'HTML' — a label or hostname
-              // containing '<' or '&' would otherwise produce a Telegram 400.
-              await sender.send(escapeHtml(text));
-            },
-            deleteMessage: (messageId) => sender.deleteMessage(operatorChatId, messageId),
-            now: () => Date.now(),
-          }),
+        onUpdate: (update) => {
+          if (update.callback_query !== undefined) {
+            return handleCallback(update, callbackDeps);
+          }
+          return handleUpdate(update, commandDeps);
+        },
       }).catch((err: unknown) => {
         onReceiverStopped(err, {
           // Same clean-shutdown sequence a SIGTERM gets, but exiting 1.

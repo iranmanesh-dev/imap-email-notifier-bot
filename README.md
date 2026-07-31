@@ -220,16 +220,12 @@ boot — it never starts with a partially-valid configuration.
 
 ### Adding a mailbox
 
-Mailboxes are configured at runtime by messaging the bot — there is no `MAILBOXES`
-variable, and a fresh install legitimately starts with zero mailboxes configured. Send:
+Message the bot `/start` and use the buttons — Add walks you through it one field at a
+time, with quick-picks for common IMAP hosts and the standard port. The password is asked
+for separately and deleted from the chat as soon as it is read.
 
-```
-/add Work imap.hostinger.com 993 me@mydomain.com
-```
-
-The bot asks for the password as a separate message and deletes it as soon as it has
-read it, then tests the credentials before saving. Other commands: `/list`,
-`/remove <label>`, `/status`, `/test <label>`.
+Typed commands still work if you prefer them: `/add <label> <host> <port> <username>`,
+`/list`, `/remove <label>`, `/status`, `/test <label>`.
 
 **`MASTER_KEY` is not recoverable.** It encrypts every stored mailbox password. If you
 lose it or change it, stored passwords can no longer be decrypted and you must re-add

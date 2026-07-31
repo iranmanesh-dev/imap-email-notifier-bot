@@ -246,3 +246,121 @@ describe('deleteMessage', () => {
     expect(await sender.deleteMessage('42', 7)).toBe(false);
   });
 });
+
+describe('keyboards and callbacks', () => {
+  it('includes reply_markup when a keyboard is passed to send', async () => {
+    const calls: RequestInit[] = [];
+    const sender = makeSender((async (_u: string, init: RequestInit) => {
+      calls.push(init);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    await sender.send('<b>hi</b>', [[{ text: 'Add', callback_data: 'a' }]]);
+
+    const body = JSON.parse(calls[0]!.body as string);
+    expect(body.reply_markup).toEqual({ inline_keyboard: [[{ text: 'Add', callback_data: 'a' }]] });
+  });
+
+  it('omits reply_markup entirely when no keyboard is passed', async () => {
+    const calls: RequestInit[] = [];
+    const sender = makeSender((async (_u: string, init: RequestInit) => {
+      calls.push(init);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    await sender.send('<b>hi</b>');
+
+    expect(JSON.parse(calls[0]!.body as string)).not.toHaveProperty('reply_markup');
+  });
+
+  it('answerCallbackQuery posts the id and reports success', async () => {
+    const calls: [string, RequestInit][] = [];
+    const sender = makeSender((async (url: string, init: RequestInit) => {
+      calls.push([url, init]);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    expect(await sender.answerCallbackQuery('cbq-1', 'done')).toBe(true);
+    expect(calls[0]![0]).toContain('/answerCallbackQuery');
+    expect(JSON.parse(calls[0]![1].body as string)).toEqual({
+      callback_query_id: 'cbq-1',
+      text: 'done',
+    });
+  });
+
+  it('answerCallbackQuery omits text when not supplied', async () => {
+    const calls: RequestInit[] = [];
+    const sender = makeSender((async (_u: string, init: RequestInit) => {
+      calls.push(init);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    await sender.answerCallbackQuery('cbq-1');
+    expect(JSON.parse(calls[0]!.body as string)).toEqual({ callback_query_id: 'cbq-1' });
+  });
+
+  it('answerCallbackQuery reports false rather than throwing on a network error', async () => {
+    const sender = makeSender((async () => { throw new Error('ECONNRESET'); }) as unknown as typeof fetch);
+    expect(await sender.answerCallbackQuery('cbq-1')).toBe(false);
+  });
+
+  it('editMessageText posts chat, message id, HTML and keyboard', async () => {
+    const calls: [string, RequestInit][] = [];
+    const sender = makeSender((async (url: string, init: RequestInit) => {
+      calls.push([url, init]);
+      return jsonResponse(200, { ok: true });
+    }) as unknown as typeof fetch);
+
+    const ok = await sender.editMessageText('42', 7, '<b>x</b>', [[{ text: 'B', callback_data: 'b' }]]);
+
+    expect(ok).toBe(true);
+    expect(calls[0]![0]).toContain('/editMessageText');
+    const body = JSON.parse(calls[0]![1].body as string);
+    expect(body).toMatchObject({
+      chat_id: '42',
+      message_id: 7,
+      text: '<b>x</b>',
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: 'B', callback_data: 'b' }]] },
+    });
+  });
+
+  it('editMessageText reports false when Telegram refuses (message too old)', async () => {
+    const sender = makeSender(
+      (async () => jsonResponse(400, { ok: false, description: 'message to edit not found' })) as unknown as typeof fetch
+    );
+    expect(await sender.editMessageText('42', 7, 'x')).toBe(false);
+  });
+
+  it('editMessageText reports false rather than throwing on a network error', async () => {
+    const sender = makeSender((async () => { throw new Error('ECONNRESET'); }) as unknown as typeof fetch);
+    expect(await sender.editMessageText('42', 7, 'x')).toBe(false);
+  });
+
+  it('editMessageText reports success when Telegram says the message is not modified', async () => {
+    // Telegram 400s a no-op edit with "message is not modified". Treating
+    // that like "too old" made callbacks.ts's show() fall back to POSTING A
+    // NEW MESSAGE, so double-tapping Back appended a duplicate menu every
+    // time. The requested state IS the displayed state here, so this is a
+    // success — the one 400 that must not reach the fallback.
+    const sender = makeSender(
+      (async () =>
+        jsonResponse(400, {
+          ok: false,
+          error_code: 400,
+          description: 'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
+        })) as unknown as typeof fetch
+    );
+    expect(await sender.editMessageText('42', 7, 'x')).toBe(true);
+  });
+
+  // Removed: a "never puts the bot token in a returned value" test used to
+  // live here. It asserted String(await sender.answerCallbackQuery('x'))
+  // does not contain the token — but that stringifies a BOOLEAN, so it could
+  // never fail for any implementation, while its name implied token leakage
+  // was covered. No public method on TelegramSender returns anything but a
+  // boolean or a SendOutcome, so there is no return-value leak path to
+  // exercise; the token appears only in #baseUrl, which is never surfaced.
+  // A test that cannot fail is worse than no test: it stops the next reader
+  // from writing a real one.
+});

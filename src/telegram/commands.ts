@@ -1,6 +1,11 @@
-import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, type Conversations } from './conversation.js';
+import {
+  CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, cancellationNotice, type Conversations,
+} from './conversation.js';
+import { cancelKeyboard, hostPickKeyboard, menuKeyboard } from './keyboards.js';
+import { PLAIN_STATUS, buildStatusReport } from './status.js';
 import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
+import type { InlineKeyboard } from './sender.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
 import type { WatcherRegistry } from '../imap/registry.js';
@@ -14,9 +19,14 @@ export type CommandDeps = {
   registry: WatcherRegistry;
   conversations: Conversations;
   probe: (account: Account) => Promise<ProbeResult>;
-  reply: (text: string) => Promise<void>;
+  // Optional so all pre-existing callers/tests (which pass none) keep
+  // working unchanged; only the wizard's host prompt currently uses it.
+  reply: (text: string, keyboard?: InlineKeyboard) => Promise<void>;
   deleteMessage: (messageId: number) => Promise<boolean>;
   now: () => number;
+  // Optional so all pre-existing callers/tests (which pass none) keep
+  // working unchanged. Renders the button menu for /start, /help and /menu.
+  menu?: () => Promise<void>;
 };
 
 const USAGE = [
@@ -48,9 +58,64 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
   const pending = deps.conversations.take(message.chat.id, deps.now());
   if (pending !== null) {
     if (!text.startsWith('/')) {
+      if (pending.kind === 'wizard-label') {
+        // The same pre-check /add does, at the only step that can make it.
+        // Without it the operator walks all five steps, sends a password,
+        // has it deleted and a real IMAP login run — and only then does
+        // mailboxes.add throw "already exists", with nothing saved.
+        if (deps.mailboxes.labels().includes(text)) {
+          // Stay on the label step so another label can simply be sent.
+          deps.conversations.set(message.chat.id, {
+            kind: 'wizard-label', expiresAt: deps.now() + WIZARD_TTL_MS,
+          });
+          return deps.reply(
+            `A mailbox labelled "${text}" already exists. Send a different label, ` +
+              `or remove that one first.`,
+            cancelKeyboard()
+          );
+        }
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-host', label: text, expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply(
+          'Which IMAP host? Send it as your next message, e.g. imap.hostinger.com',
+          hostPickKeyboard()
+        );
+      }
+      if (pending.kind === 'wizard-host') {
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-port', label: pending.label, host: text, expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply('Which port? Send a number — 993 is standard.');
+      }
+      if (pending.kind === 'wizard-port') {
+        const port = Number(text);
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+          // Re-prompt WITHOUT advancing, so a typo cannot skip a field.
+          deps.conversations.set(message.chat.id, {
+            kind: 'wizard-port', label: pending.label, host: pending.host,
+            expiresAt: deps.now() + WIZARD_TTL_MS,
+          });
+          return deps.reply('That is not a valid port. Send a number between 1 and 65535.');
+        }
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-username', label: pending.label, host: pending.host, port,
+          expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply('Send the username or email address for this mailbox.');
+      }
+      if (pending.kind === 'wizard-username') {
+        deps.conversations.set(message.chat.id, {
+          kind: 'password', label: pending.label, host: pending.host, port: pending.port,
+          username: text, expiresAt: deps.now() + PASSWORD_TTL_MS,
+        });
+        return deps.reply(
+          'Now send the password. I will delete your message as soon as I have read it.'
+        );
+      }
       if (pending.kind === 'password') {
         await completeAdd(pending, text, message.message_id, deps);
-      } else {
+      } else if (pending.kind === 'remove-confirm') {
         await completeRemove(pending.label, text, deps);
       }
       return;
@@ -60,8 +125,9 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
     // mid-flow would be stored as a password or a removal confirmation.
     // The pending state is already discarded (take() is single-use); tell
     // the operator so they can't mistake this for "password accepted".
-    const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
-    await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
+    // The wording lives in conversation.ts because handleCallback applies
+    // the identical rule to a button tap arriving mid-flow.
+    await deps.reply(cancellationNotice(pending));
   }
 
   const [command, ...args] = text.split(/\s+/);
@@ -78,6 +144,8 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
       return testMailbox(args, deps);
     case '/start':
     case '/help':
+    case '/menu':
+      if (deps.menu !== undefined) await deps.menu();
       return deps.reply(USAGE);
     default:
       return deps.reply(`Unknown command.\n\n${USAGE}`);
@@ -140,6 +208,10 @@ async function completeAdd(
     secure: true,
   };
 
+  // Every terminal message below carries the menu. completeAdd is where a
+  // BUTTON-driven add lands (its last two steps are typed), so ending
+  // without a keyboard leaves the operator with no way back — while the
+  // spec says the menu is shown after any action completes.
   const result = await deps.probe(account);
   if (!result.ok) {
     // Scrubbed again here even though probeMailbox already scrubs its own
@@ -147,7 +219,8 @@ async function completeAdd(
     // where text actually leaves for Telegram — the last place that can
     // still guarantee it. Cheap, and it makes the guarantee local.
     return deps.reply(
-      `Could not connect, so nothing was saved.\n\n${scrubSecret(result.reason, password)}`
+      `Could not connect, so nothing was saved.\n\n${scrubSecret(result.reason, password)}`,
+      menuKeyboard()
     );
   }
 
@@ -155,7 +228,7 @@ async function completeAdd(
     deps.mailboxes.add(account);
   } catch (err) {
     // Failed before persisting anything — nothing to clean up.
-    return deps.reply(`Failed to save: ${scrubSecret(errorText(err), password)}`);
+    return deps.reply(`Failed to save: ${scrubSecret(errorText(err), password)}`, menuKeyboard());
   }
 
   try {
@@ -168,13 +241,15 @@ async function completeAdd(
       `Saved "${account.label}", but failed to start watching it: ` +
         `${scrubSecret(errorText(err), password)}\n` +
         `It is not being monitored. Run /remove "${account.label}" and add it again, ` +
-        `or restart the bot to retry starting the watcher.`
+        `or restart the bot to retry starting the watcher.`,
+      menuKeyboard()
     );
   }
 
   return deps.reply(
     `Connected — ${result.folders} folders. Saved "${account.label}" and now watching it.\n` +
-      `The first sweep records a baseline, so you'll be notified from the next email onward.`
+      `The first sweep records a baseline, so you'll be notified from the next email onward.`,
+    menuKeyboard()
   );
 }
 
@@ -255,44 +330,15 @@ async function completeRemove(label: string, answer: string, deps: CommandDeps):
 }
 
 /**
- * Reconciles the two sources of truth rather than reporting only one.
- *
- * /list reads the store; the registry holds the live watchers. A mailbox
- * can be in the store with no watcher — skipped during the startup restore,
- * or persisted by /add whose registry.add then failed. Reporting only the
- * registry made such a mailbox invisible here while /list showed it as
- * perfectly normal, even though /status is the operator's only view into
- * connection health.
+ * The reconciliation and wording live in status.ts because the button
+ * surface renders the identical report — see buildStatusReport for why
+ * reporting the registry alone was wrong.
  */
 async function showStatus(deps: CommandDeps): Promise<void> {
-  const states = deps.registry.states();
-  const watched = new Set(states.map((s) => s.label));
-
-  let unwatched: string[] = [];
-  try {
-    unwatched = deps.mailboxes.labels().filter((label) => !watched.has(label));
-  } catch (err) {
-    // labels() does not decrypt, so this is a genuine storage failure. Say
-    // so rather than silently under-reporting.
-    await deps.reply(`Warning: could not read the saved mailbox list: ${errorText(err)}`);
-  }
-
-  if (states.length === 0 && unwatched.length === 0) {
-    return deps.reply('No mailboxes are being watched. Add one with /add.');
-  }
-
-  const lines = [
-    ...states.map((s) => `• ${s.label} — ${s.state}`),
-    ...unwatched.map((label) => `• ${label} — NOT BEING WATCHED (saved, but no watcher running)`),
-  ];
-
-  const hint =
-    unwatched.length > 0
-      ? `\n\nA saved mailbox with no watcher is not delivering anything. ` +
-        `Try /test <label> to see why, then restart the bot or /remove and /add it again.`
-      : '';
-
-  return deps.reply(`Watcher status:\n${lines.join('\n')}${hint}`);
+  const report = buildStatusReport(deps, PLAIN_STATUS);
+  if (report.warning !== null) await deps.reply(report.warning);
+  if (report.empty) return deps.reply('No mailboxes are being watched. Add one with /add.');
+  return deps.reply(report.text);
 }
 
 async function testMailbox(args: string[], deps: CommandDeps): Promise<void> {
