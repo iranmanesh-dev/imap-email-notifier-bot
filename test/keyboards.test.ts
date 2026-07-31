@@ -60,6 +60,8 @@ describe('encode/decode round-trip', () => {
     { kind: 'port', value: 993 },
     { kind: 'type-host' },
     { kind: 'type-port' },
+    // Boundary case: "h:" (2 bytes) + 62 bytes of value == exactly the cap.
+    { kind: 'host', value: 'a'.repeat(CALLBACK_DATA_MAX_BYTES - 2) },
   ];
 
   it.each(cases)('round-trips %j', (action) => {
@@ -84,6 +86,30 @@ describe('encode/decode round-trip', () => {
     expect(decodeAction(encodeAction({ kind: 'test-pick' }))).toEqual({ kind: 'test-pick' });
     expect(decodeAction(encodeAction({ kind: 'type-port' }))).toEqual({ kind: 'type-port' });
     expect(encodeAction({ kind: 'test-pick' })).not.toBe(encodeAction({ kind: 'type-port' }));
+  });
+});
+
+describe('encodeAction enforces the byte cap by construction', () => {
+  it('does not throw for a host value that lands exactly on the cap', () => {
+    const value = 'a'.repeat(CALLBACK_DATA_MAX_BYTES - 2); // "h:" prefix is 2 bytes
+    expect(() => encodeAction({ kind: 'host', value })).not.toThrow();
+    expect(byteLen(encodeAction({ kind: 'host', value }))).toBe(CALLBACK_DATA_MAX_BYTES);
+  });
+
+  it('throws for a host value that pushes one byte past the cap', () => {
+    const value = 'a'.repeat(CALLBACK_DATA_MAX_BYTES - 1); // one byte over
+    expect(() => encodeAction({ kind: 'host', value })).toThrow();
+  });
+});
+
+describe('encodeAction validates ports against the same range decodeAction enforces', () => {
+  it.each([1, 65535])('round-trips the boundary port %d', (value) => {
+    const action: CallbackAction = { kind: 'port', value };
+    expect(decodeAction(encodeAction(action))).toEqual(action);
+  });
+
+  it.each([0, -1, 65536, 993.5])('throws encoding an out-of-range or non-integer port %s', (value) => {
+    expect(() => encodeAction({ kind: 'port', value })).toThrow();
   });
 });
 

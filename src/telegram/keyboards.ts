@@ -29,6 +29,14 @@ export type CallbackAction =
  * older message could then act on the wrong mailbox, which is a data-loss
  * bug. A hash is stable and self-invalidating: if it no longer resolves,
  * the mailbox is genuinely gone.
+ *
+ * Trade-off: 8 hex characters is only 32 bits of hash, so a collision
+ * between two distinct labels is possible in principle — `resolveToken`
+ * would then silently resolve to the wrong mailbox. At realistic mailbox
+ * counts (single digits to low hundreds per operator) the birthday-bound
+ * probability (~n²/2³³) is negligible, and widening the token eats further
+ * into the 64-byte callback_data budget for no practical benefit. The
+ * trade is accepted deliberately, not overlooked.
  */
 export function labelToken(label: string): string {
   return createHash('sha256').update(label, 'utf8').digest('hex').slice(0, 8);
@@ -39,7 +47,40 @@ export function resolveToken(token: string, labels: string[]): string | null {
   return labels.find((l) => labelToken(l) === token) ?? null;
 }
 
+const MIN_PORT = 1;
+const MAX_PORT = 65535;
+
+/**
+ * Encodes a `CallbackAction` as `callback_data`.
+ *
+ * This is a programming-error guard, not a user-input path: it throws
+ * rather than truncating or clamping, because a silently truncated host
+ * would produce a button that connects to the *wrong server*, and a
+ * silently clamped port would test the wrong one — both worse than a loud
+ * failure at build time. Every string this function returns must therefore
+ * be something `decodeAction` can reconstruct, and must fit Telegram's cap.
+ */
 export function encodeAction(action: CallbackAction): string {
+  if (action.kind === 'port') {
+    const { value } = action;
+    if (!Number.isInteger(value) || value < MIN_PORT || value > MAX_PORT) {
+      throw new Error(
+        `encodeAction: 'port' value ${value} is outside the valid range ${MIN_PORT}-${MAX_PORT}`
+      );
+    }
+  }
+
+  const data = encodeActionData(action);
+  const bytes = Buffer.byteLength(data, 'utf8');
+  if (bytes > CALLBACK_DATA_MAX_BYTES) {
+    throw new Error(
+      `encodeAction: '${action.kind}' action encodes to ${bytes} bytes, exceeding the ${CALLBACK_DATA_MAX_BYTES}-byte callback_data cap`
+    );
+  }
+  return data;
+}
+
+function encodeActionData(action: CallbackAction): string {
   switch (action.kind) {
     case 'menu': return 'm';
     case 'add': return 'a';
@@ -85,7 +126,7 @@ export function decodeAction(data: string): CallbackAction | null {
     case 'h': return { kind: 'host', value };
     case 'p': {
       const port = Number(value);
-      if (!Number.isInteger(port) || port <= 0 || port > 65535) return null;
+      if (!Number.isInteger(port) || port < MIN_PORT || port > MAX_PORT) return null;
       return { kind: 'port', value: port };
     }
     default: return null;
