@@ -335,6 +335,23 @@ describe('callback queries', () => {
     expect(seen).toHaveLength(0);
   });
 
+  it('advances the offset past an update with a valid id but an invalid callback_query, without forwarding it', async () => {
+    const urls: string[] = [];
+    const seen: unknown[] = [];
+    let poll = 0;
+    const badCbUpdate = { update_id: 9, callback_query: { from: { id: 42 }, data: 'm' } };
+    const fetchImpl = (async (url: string) => {
+      if (url.includes('deleteWebhook')) return jsonResponse(200, { ok: true });
+      urls.push(url);
+      poll += 1;
+      return poll === 1 ? okUpdates([badCbUpdate as unknown as TelegramUpdate]) : okUpdates([]);
+    }) as unknown as typeof fetch;
+
+    await runUntil(fetchImpl, 3, async (u) => { seen.push(u); });
+    expect(urls[1]).toContain('offset=10');
+    expect(seen).toHaveLength(0);
+  });
+
   it('still forwards ordinary message updates', async () => {
     const seen: string[] = [];
     const fetchImpl = (async (url: string) =>
