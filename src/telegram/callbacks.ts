@@ -12,6 +12,7 @@ import type { WatcherRegistry } from '../imap/registry.js';
 import type { ProbeResult } from '../imap/probe.js';
 import type { Account } from '../types.js';
 import { escapeHtml } from '../mail/format.js';
+import { HTML_STATUS, buildStatusReport } from './status.js';
 import { scrubSecret } from '../scrub.js';
 
 export type CallbackDeps = {
@@ -432,13 +433,22 @@ async function showList(deps: CallbackDeps, messageId: number | undefined): Prom
   return show(deps, messageId, `Configured mailboxes:\n${lines.join('\n')}`, backKeyboard());
 }
 
+/**
+ * Renders the SAME report /status renders, only with markup.
+ *
+ * This view used to read the registry alone, so a saved-but-unwatched
+ * mailbox — the exact failure the operator opens this screen to diagnose —
+ * was silently missing from it, while /status named it and offered a
+ * recovery hint. Sharing buildStatusReport is what stops the two from
+ * drifting again.
+ */
 async function showStatus(deps: CallbackDeps, messageId: number | undefined): Promise<void> {
-  const states = deps.registry.states();
-  if (states.length === 0) {
+  const report = buildStatusReport(deps, HTML_STATUS);
+  if (report.warning !== null) await deps.reply(report.warning);
+  if (report.empty) {
     return show(deps, messageId, 'No mailboxes are being watched.', menuKeyboard());
   }
-  const lines = states.map((s) => `• <b>${escapeHtml(s.label)}</b> — ${escapeHtml(s.state)}`);
-  return show(deps, messageId, `Watcher status:\n${lines.join('\n')}`, backKeyboard());
+  return show(deps, messageId, report.text, backKeyboard());
 }
 
 async function showPicker(

@@ -204,6 +204,57 @@ describe('menu, list and status', () => {
     expect(edits[0]).toContain('ok');
   });
 
+  // The button Status view read the registry only, while /status reconciles
+  // it against the store. A mailbox skipped during the startup restore, or
+  // one /add persisted before registry.add failed, was therefore invisible
+  // in the view the README now points operators at first.
+
+  it('status flags a saved mailbox that has no watcher running', async () => {
+    const { deps, edits } = makeDeps();
+    deps.mailboxes.add({ label: 'Ghosted', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleCallback(tap('s'), deps);
+
+    expect(edits.at(-1)).toContain('Work');
+    expect(edits.at(-1)).toContain('Ghosted');
+    expect(edits.at(-1)).toMatch(/not being watched/i);
+  });
+
+  it('status does not claim nothing is watched when every saved mailbox is unwatched', async () => {
+    const { deps, edits } = makeDeps();
+    deps.mailboxes.add({ label: 'Ghosted', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+
+    await handleCallback(tap('s'), deps);
+
+    expect(edits.at(-1)).toContain('Ghosted');
+    expect(edits.at(-1)).toMatch(/not being watched/i);
+    expect(edits.at(-1)).not.toMatch(/^No mailboxes are being watched/);
+  });
+
+  it('status carries the same recovery hint the typed command gives, escaped for HTML', async () => {
+    const { deps, edits } = makeDeps();
+    deps.mailboxes.add({ label: 'Ghosted', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    await handleCallback(tap('s'), deps);
+    expect(edits.at(-1)).toMatch(/\/test/);
+    // The hint embeds a literal "<label>" placeholder. Unescaped, Telegram
+    // rejects the whole message as bad HTML and the operator sees nothing.
+    expect(edits.at(-1)).toContain('&lt;label&gt;');
+  });
+
+  it('status reports a failure to read the saved mailbox list instead of under-reporting', async () => {
+    const { deps, edits, replies } = makeDeps();
+    await deps.registry.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    deps.mailboxes.labels = () => {
+      throw new Error('database is locked');
+    };
+
+    await handleCallback(tap('s'), deps);
+
+    expect(replies.some((r) => /database is locked/.test(r))).toBe(true);
+    expect(edits.at(-1)).toContain('Work');
+  });
+
   it('remove-pick with no mailboxes says so instead of showing an empty keyboard', async () => {
     const { deps, edits } = makeDeps();
     await handleCallback(tap('rp'), deps);
