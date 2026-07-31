@@ -122,6 +122,7 @@ describe('createEmailHandler', () => {
   const email: NormalizedEmail = {
     messageId: '<abc@example.com>',
     accountLabel: 'Work',
+    mailboxAddress: 'me@work.example',
     folder: 'INBOX',
     from: 'alice@example.com',
     subject: 'Hello there',

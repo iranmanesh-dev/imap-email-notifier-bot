@@ -160,6 +160,10 @@ then every 24 hours, so a redeploy-heavy environment still enforces the bound.
 
 ### Message format
 
+> **Superseded.** The layout below is the original design. The shipped format is the
+> hashtag layout shown in the README ("What a notification looks like"); the escaping and
+> per-field truncation requirements stated in this section still apply unchanged.
+
 One Telegram message per email, `parse_mode: HTML`:
 
 ```

@@ -4,6 +4,7 @@ import type { NormalizedEmail } from '../types.js';
 
 export type ParseContext = {
   accountLabel: string;
+  mailboxAddress: string;
   folder: string;
   previewChars: number;
 };
@@ -65,7 +66,13 @@ export async function parseEmail(source: Buffer, ctx: ParseContext): Promise<Nor
   const parsed = await simpleParser(source, { skipHtmlToText: true });
 
   const subject = parsed.subject ?? '';
-  const from = parsed.from?.text ?? '(unknown sender)';
+  // Prefer the bare address over `from.text` ("Alice <alice@example.com>"),
+  // because the notification shows a sender *address*. A display name is
+  // attacker-controlled and routinely spoofs a different address; the
+  // address is the part worth showing. Fall back to the full text only
+  // when the header is malformed enough that no address parsed out of it.
+  const from =
+    parsed.from?.value?.[0]?.address?.trim() || parsed.from?.text?.trim() || '(unknown sender)';
   const date = parsed.date ?? new Date();
 
   const body = parsed.text || (parsed.html ? stripHtml(parsed.html) : '');
@@ -76,6 +83,7 @@ export async function parseEmail(source: Buffer, ctx: ParseContext): Promise<Nor
   return {
     messageId,
     accountLabel: ctx.accountLabel,
+    mailboxAddress: ctx.mailboxAddress,
     folder: ctx.folder,
     from,
     subject,

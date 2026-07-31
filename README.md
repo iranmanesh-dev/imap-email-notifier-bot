@@ -17,6 +17,27 @@ Hostinger and a real IMAP server in CI:
 | Fastmail | `imap.fastmail.com` | 993 |
 | Self-hosted / cPanel | your mail host | 993 |
 
+### What a notification looks like
+
+```
+#Work_Mail
+#Gmail_All_Mail
+from: alice@example.com
+to: me@example.com
+subject: Invoice #1042 due Friday
+Hi, please find attached the invoice for July. Let me know if anything looks off.
+```
+
+The mailbox label and folder are hashtags, so tapping one filters your chat to that
+mailbox or folder. Telegram ends a hashtag at the first character that isn't a letter,
+digit or underscore, so names are joined with underscores — `Work Mail` becomes
+`#Work_Mail` and `[Gmail]/All Mail` becomes `#Gmail_All_Mail`.
+
+`to:` is the address you configured for that mailbox, not the message's `To:` header —
+mail reaching you via an alias, a BCC or a forward still shows which of your mailboxes
+received it. `from:` is the sender's address; the display name is deliberately dropped,
+since it is attacker-controlled and routinely spoofs a different address.
+
 ### How it works
 
 An IMAP `IDLE` connection parked on INBOX gives near-instant delivery, while a cheap

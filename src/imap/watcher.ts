@@ -430,6 +430,7 @@ export class AccountWatcher {
         if (!this.#sweepClient?.usable) throw new Error('sweep client not connected');
         const result = await sweep(imapSweepDeps(this.#sweepClient), {
           accountLabel: this.#opts.account.label,
+          mailboxAddress: this.#opts.account.user,
           previewChars: this.#opts.previewChars,
           store: this.#opts.store,
           onEmail: this.#opts.onEmail,

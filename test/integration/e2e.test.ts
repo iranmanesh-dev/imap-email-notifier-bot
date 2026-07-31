@@ -146,6 +146,7 @@ function collector(accountLabel = 'Test') {
     received,
     opts: {
       accountLabel,
+      mailboxAddress: 'me@test.example',
       previewChars: 200,
       store,
       onEmail: async (email: NormalizedEmail) => {
@@ -332,6 +333,7 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
     const delivered: NormalizedEmail[] = [];
     const firstAttempt = {
       accountLabel: 'Retry',
+      mailboxAddress: 'me@test.example',
       previewChars: 200,
       store,
       onEmail: async (email: NormalizedEmail) => {
@@ -362,6 +364,7 @@ describe('end to end against a real IMAP server (GreenMail)', () => {
 
     const secondAttempt = {
       accountLabel: 'Retry',
+      mailboxAddress: 'me@test.example',
       previewChars: 200,
       store,
       onEmail: async (email: NormalizedEmail) => {

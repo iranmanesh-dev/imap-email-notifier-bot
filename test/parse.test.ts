@@ -7,7 +7,12 @@ function fixture(name: string): Buffer {
   return readFileSync(fileURLToPath(new URL(`./fixtures/${name}`, import.meta.url)));
 }
 
-const ctx = { accountLabel: 'Work', folder: 'INBOX', previewChars: 200 };
+const ctx = {
+  accountLabel: 'Work',
+  mailboxAddress: 'me@work.example',
+  folder: 'INBOX',
+  previewChars: 200,
+};
 
 describe('parseEmail', () => {
   it('extracts sender, subject and message id from plaintext mail', async () => {
@@ -18,9 +23,16 @@ describe('parseEmail', () => {
     expect(email.preview).toContain('free for lunch tomorrow');
   });
 
-  it('carries the account label and folder through', async () => {
+  it('extracts the bare sender address, dropping the display name', async () => {
+    const email = await parseEmail(fixture('plain.eml'), ctx);
+    expect(email.from).toBe('alice@example.com');
+    expect(email.from).not.toContain('Alice Smith');
+  });
+
+  it('carries the account label, mailbox address and folder through', async () => {
     const email = await parseEmail(fixture('plain.eml'), { ...ctx, folder: 'Archive' });
     expect(email.accountLabel).toBe('Work');
+    expect(email.mailboxAddress).toBe('me@work.example');
     expect(email.folder).toBe('Archive');
   });
 
@@ -56,7 +68,12 @@ describe('parseEmail', () => {
   it('decodes RFC 2047 encoded-word subjects in a non-UTF-8 charset', async () => {
     const email = await parseEmail(fixture('latin1.eml'), ctx);
     expect(email.subject).toBe('Déjeuner à midi?');
-    expect(email.from).toContain('René Müller');
+    // The From: header here is an encoded-word display name wrapping a plain
+    // address. We keep the address and drop the name by design, so decoding
+    // is asserted on the subject above; what matters here is that an
+    // encoded-word From: still yields the address rather than mojibake or
+    // the raw `=?iso-8859-1?Q?...?=` token.
+    expect(email.from).toBe('rene@example.com');
   });
 
   it('decodes a quoted-printable ISO-8859-1 body', async () => {

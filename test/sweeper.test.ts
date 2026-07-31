@@ -60,7 +60,7 @@ function makeDeps(folders: Record<string, FakeFolder>) {
 }
 
 function makeOpts(onEmail: (e: NormalizedEmail) => Promise<void>, accountLabel = 'Work') {
-  return { accountLabel, previewChars: 200, store, onEmail };
+  return { accountLabel, mailboxAddress: 'me@work.example', previewChars: 200, store, onEmail };
 }
 
 describe('sweep', () => {

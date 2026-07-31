@@ -26,6 +26,7 @@ export const MAX_MESSAGES_PER_SWEEP = 50;
 
 export type SweepOptions = {
   accountLabel: string;
+  mailboxAddress: string;
   previewChars: number;
   store: SeenStore;
   onEmail: (email: NormalizedEmail) => Promise<void>;
@@ -97,6 +98,7 @@ async function sweepFolder(deps: SweepDeps, opts: SweepOptions, path: string): P
   for (const message of messages) {
     const email = await parseEmail(message.source, {
       accountLabel: opts.accountLabel,
+      mailboxAddress: opts.mailboxAddress,
       folder: path,
       previewChars: opts.previewChars,
     });
