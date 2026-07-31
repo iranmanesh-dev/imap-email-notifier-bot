@@ -177,3 +177,49 @@ describe('menu, list and status', () => {
     expect(edits[0]).not.toContain('<b>X');
   });
 });
+
+describe('add wizard', () => {
+  it('add starts the wizard and asks for a label', async () => {
+    const { deps, edits } = makeDeps();
+    await handleCallback(tap('a'), deps);
+    expect(edits[0]).toMatch(/label/i);
+    expect(deps.conversations.size()).toBe(1);
+  });
+
+  it('cancel clears the pending wizard and returns to the menu', async () => {
+    const { deps, edits } = makeDeps();
+    await handleCallback(tap('a'), deps);
+    await handleCallback(tap('c'), deps);
+    expect(deps.conversations.size()).toBe(0);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+  });
+
+  it('a host quick-pick advances to the port step', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+    await handleCallback(tap(encodeAction({ kind: 'host', value: 'imap.hostinger.com' })), deps);
+    expect(edits.at(-1)).toMatch(/port/i);
+  });
+
+  it('a port quick-pick advances to the username step', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'Work', host: 'h', expiresAt: NOW + 60_000 });
+    await handleCallback(tap(encodeAction({ kind: 'port', value: 993 })), deps);
+    expect(edits.at(-1)).toMatch(/username|email/i);
+  });
+
+  it('type-host asks the operator to type a host and keeps the wizard pending', async () => {
+    const { deps, edits } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+    await handleCallback(tap('xh'), deps);
+    expect(edits.at(-1)).toMatch(/host/i);
+    expect(deps.conversations.size()).toBe(1);
+  });
+
+  it('a host pick with no wizard pending returns to the menu instead of guessing', async () => {
+    const { deps, edits } = makeDeps();
+    await handleCallback(tap(encodeAction({ kind: 'host', value: 'imap.x.com' })), deps);
+    expect(edits.at(-1)).toMatch(/mailbox/i);
+    expect(deps.conversations.size()).toBe(0);
+  });
+});

@@ -1,4 +1,4 @@
-import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, type Conversations } from './conversation.js';
+import { CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, type Conversations } from './conversation.js';
 import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
 import type { MailboxStore } from '../store/mailboxes.js';
@@ -48,12 +48,48 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
   const pending = deps.conversations.take(message.chat.id, deps.now());
   if (pending !== null) {
     if (!text.startsWith('/')) {
+      if (pending.kind === 'wizard-label') {
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-host', label: text, expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply('Which IMAP host? Send it as your next message, e.g. imap.hostinger.com');
+      }
+      if (pending.kind === 'wizard-host') {
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-port', label: pending.label, host: text, expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply('Which port? Send a number — 993 is standard.');
+      }
+      if (pending.kind === 'wizard-port') {
+        const port = Number(text);
+        if (!Number.isInteger(port) || port <= 0 || port > 65535) {
+          // Re-prompt WITHOUT advancing, so a typo cannot skip a field.
+          deps.conversations.set(message.chat.id, {
+            kind: 'wizard-port', label: pending.label, host: pending.host,
+            expiresAt: deps.now() + WIZARD_TTL_MS,
+          });
+          return deps.reply('That is not a valid port. Send a number between 1 and 65535.');
+        }
+        deps.conversations.set(message.chat.id, {
+          kind: 'wizard-username', label: pending.label, host: pending.host, port,
+          expiresAt: deps.now() + WIZARD_TTL_MS,
+        });
+        return deps.reply('Send the username or email address for this mailbox.');
+      }
+      if (pending.kind === 'wizard-username') {
+        deps.conversations.set(message.chat.id, {
+          kind: 'password', label: pending.label, host: pending.host, port: pending.port,
+          username: text, expiresAt: deps.now() + PASSWORD_TTL_MS,
+        });
+        return deps.reply(
+          'Now send the password. I will delete your message as soon as I have read it.'
+        );
+      }
       if (pending.kind === 'password') {
         await completeAdd(pending, text, message.message_id, deps);
       } else if (pending.kind === 'remove-confirm') {
         await completeRemove(pending.label, text, deps);
       }
-      // Wizard states are handled by their own message handlers (Tasks 5-7)
       return;
     }
     // A `/`-prefixed message during a pending flow must be treated as a
@@ -64,8 +100,14 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
     if (pending.kind === 'password' || pending.kind === 'remove-confirm') {
       const flowName = pending.kind === 'password' ? 'password prompt' : 'removal confirmation';
       await deps.reply(`Cancelled the pending ${flowName} for "${pending.label}".`);
+    } else if (
+      pending.kind === 'wizard-label' ||
+      pending.kind === 'wizard-host' ||
+      pending.kind === 'wizard-port' ||
+      pending.kind === 'wizard-username'
+    ) {
+      await deps.reply('Cancelled the pending mailbox setup.');
     }
-    // Wizard states will log their own cancellation in their handlers
   }
 
   const [command, ...args] = text.split(/\s+/);

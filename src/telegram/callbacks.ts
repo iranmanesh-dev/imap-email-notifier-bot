@@ -1,10 +1,11 @@
 import {
-  backKeyboard, decodeAction, mailboxKeyboard, menuKeyboard,
+  backKeyboard, cancelKeyboard, decodeAction, hostPickKeyboard, mailboxKeyboard, menuKeyboard,
+  portPickKeyboard,
   type CallbackAction,
 } from './keyboards.js';
 import type { InlineKeyboard } from './sender.js';
 import type { TelegramUpdate } from './receiver.js';
-import type { Conversations } from './conversation.js';
+import { WIZARD_TTL_MS, type Conversations } from './conversation.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
 import type { WatcherRegistry } from '../imap/registry.js';
@@ -102,10 +103,82 @@ async function dispatch(
       return showPicker(deps, messageId, 'remove');
     case 'test-pick':
       return showPicker(deps, messageId, 'test');
+    case 'add':
+      return startWizard(deps, messageId);
+    case 'cancel':
+      deps.conversations.clear(Number(deps.operatorChatId));
+      return renderMenu(deps, messageId);
+    case 'host':
+      return applyHost(deps, messageId, action.value);
+    case 'port':
+      return applyPort(deps, messageId, action.value);
+    case 'type-host':
+      return show(deps, messageId, 'Send the IMAP host as your next message.', cancelKeyboard());
+    case 'type-port':
+      return show(deps, messageId, 'Send the port number as your next message.', cancelKeyboard());
     default:
-      // Wizard, remove and test actions are added in later tasks.
+      // remove and test actions are added in Task 7.
       return renderMenu(deps, messageId);
   }
+}
+
+export async function startWizard(deps: CallbackDeps, messageId: number | undefined): Promise<void> {
+  deps.conversations.set(Number(deps.operatorChatId), {
+    kind: 'wizard-label',
+    expiresAt: deps.now() + WIZARD_TTL_MS,
+  });
+  await show(
+    deps,
+    messageId,
+    'What should this mailbox be called? Send a short label, e.g. <b>Work</b>.',
+    cancelKeyboard()
+  );
+}
+
+/**
+ * A quick-pick only makes sense while its step is pending. Tapping a stale
+ * host button from an old message must not invent a wizard out of nothing.
+ */
+async function applyHost(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  host: string
+): Promise<void> {
+  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  if (pending === null || pending.kind !== 'wizard-host') {
+    return renderMenu(deps, messageId);
+  }
+  deps.conversations.set(Number(deps.operatorChatId), {
+    kind: 'wizard-port',
+    label: pending.label,
+    host,
+    expiresAt: deps.now() + WIZARD_TTL_MS,
+  });
+  await show(deps, messageId, `Host: <b>${escapeHtml(host)}</b>\n\nWhich port?`, portPickKeyboard());
+}
+
+async function applyPort(
+  deps: CallbackDeps,
+  messageId: number | undefined,
+  port: number
+): Promise<void> {
+  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  if (pending === null || pending.kind !== 'wizard-port') {
+    return renderMenu(deps, messageId);
+  }
+  deps.conversations.set(Number(deps.operatorChatId), {
+    kind: 'wizard-username',
+    label: pending.label,
+    host: pending.host,
+    port,
+    expiresAt: deps.now() + WIZARD_TTL_MS,
+  });
+  await show(
+    deps,
+    messageId,
+    `Port: <b>${port}</b>\n\nSend the username or email address for this mailbox.`,
+    cancelKeyboard()
+  );
 }
 
 async function showList(deps: CallbackDeps, messageId: number | undefined): Promise<void> {

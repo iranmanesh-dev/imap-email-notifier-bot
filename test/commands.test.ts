@@ -478,3 +478,52 @@ describe('/status and /test', () => {
     expect(replies[0]).toContain('***'); // scrubbed, not merely absent
   });
 });
+
+describe('wizard typed steps', () => {
+  it('a typed label advances to the host step', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('Work'), deps);
+    expect(replies.at(-1)).toMatch(/host/i);
+  });
+
+  it('a typed host advances to the port step', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('imap.example.com'), deps);
+    expect(replies.at(-1)).toMatch(/port/i);
+  });
+
+  it('an invalid typed port re-prompts without advancing', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'W', host: 'h', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('not-a-port'), deps);
+    expect(replies.at(-1)).toMatch(/port/i);
+    expect(deps.conversations.size()).toBe(1);
+  });
+
+  it('a typed username advances to the password prompt', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-username', label: 'W', host: 'h', port: 993, expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('me@example.com'), deps);
+    expect(replies.at(-1)).toMatch(/password/i);
+  });
+
+  it('the wizard ends in the same probe-and-persist path as the typed command', async () => {
+    const { deps, stored, running, deleted } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-username', label: 'W', host: 'h', port: 993, expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('me@example.com'), deps);
+    await handleUpdate(msg('s3cret', OPERATOR, 88), deps);
+
+    expect(deleted).toContain(88);
+    expect(stored.get('W')?.pass).toBe('s3cret');
+    expect(running.has('W')).toBe(true);
+  });
+
+  it('a command sent mid-wizard cancels it with a notice', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'W', expiresAt: NOW + 60_000 });
+    await handleUpdate(msg('/list'), deps);
+    expect(replies.some((r) => /cancel/i.test(r))).toBe(true);
+  });
+});
