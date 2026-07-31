@@ -638,6 +638,33 @@ async function main(): Promise<void> {
     `health on :${config.healthPort}; restoring saved mailboxes in the background`
   );
 
+  // Only worth checking when notifications go somewhere other than the
+  // operator's own chat: that chat is proven reachable by the first command
+  // reply, whereas a channel id is typed once into a config screen and
+  // otherwise never verified until mail is already being lost.
+  //
+  // Detached and after the health server is up, for the same reason the
+  // mailbox restore is: a slow or unreachable Telegram API must not hold up
+  // boot. Failure is reported to the OPERATOR's chat, since by definition
+  // the notify chat is the one we cannot reach.
+  if (config.telegramNotifyChatId !== config.telegramChatId) {
+    void notifier
+      .checkChat()
+      .then(async (result) => {
+        if (result.ok) return;
+        safeConsoleLogger.error(`notification chat unreachable: ${result.reason}`);
+        await sender.send(
+          `⚠️ <b>Email notifier</b>\nI cannot reach the notification chat ` +
+            `(<code>${escapeHtml(config.telegramNotifyChatId)}</code>): ${escapeHtml(result.reason)}\n\n` +
+            `Mail notifications will be lost until this is fixed. Check that the id is correct ` +
+            `and that this bot is an administrator of that channel with permission to post.`
+        );
+      })
+      .catch((err: unknown) => {
+        safeConsoleLogger.error(`notification chat check failed: ${errorMessage(err)}`);
+      });
+  }
+
   process.on('SIGTERM', () => beginShutdown('SIGTERM', 0));
   process.on('SIGINT', () => beginShutdown('SIGINT', 0));
 }

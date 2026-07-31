@@ -364,3 +364,79 @@ describe('keyboards and callbacks', () => {
   // A test that cannot fail is worse than no test: it stops the next reader
   // from writing a real one.
 });
+
+describe('TelegramSender.checkChat', () => {
+  it('asks getChat about its own chat id', async () => {
+    const fetchMock = vi.fn(async () => jsonResponse(200, { ok: true, result: {} }));
+    const sender = makeSender(fetchMock as unknown as typeof fetch);
+
+    expect(await sender.checkChat()).toEqual({ ok: true });
+
+    const [url, init] = fetchMock.mock.calls[0]! as unknown as [string, RequestInit];
+    expect(url).toContain('/getChat');
+    expect(JSON.parse(String(init.body))).toEqual({ chat_id: '42' });
+  });
+
+  it("reports Telegram's description when the chat cannot be reached", async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(400, { ok: false, description: 'Bad Request: chat not found' })
+    );
+    const sender = makeSender(fetchMock as unknown as typeof fetch);
+
+    expect(await sender.checkChat()).toEqual({ ok: false, reason: 'Bad Request: chat not found' });
+  });
+
+  // These two use a realistic token rather than the harness default of "T".
+  // scrubSecret replaces every occurrence of the secret unconditionally, so a
+  // one-character token turns "HTTP 502" into "H******P 502". That is the
+  // safe direction for a redaction control — over-scrubbing beats leaking,
+  // and a real bot token is a long unique string that cannot collide — but it
+  // makes a one-character token useless for asserting on message content.
+  const REALISTIC_TOKEN = '123456789:AAHkq7Xv-fakefakefakefakefakefakefak';
+
+  it('falls back to the status code when there is no description', async () => {
+    const fetchMock = vi.fn(async () => new Response('nope', { status: 502 }));
+    const sender = makeSender(fetchMock as unknown as typeof fetch, { token: REALISTIC_TOKEN });
+
+    const result = await sender.checkChat();
+    expect(result).toEqual({ ok: false, reason: 'HTTP 502' });
+  });
+
+  it('never throws when fetch itself rejects', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('getaddrinfo ENOTFOUND api.telegram.org');
+    });
+    const sender = makeSender(fetchMock as unknown as typeof fetch, { token: REALISTIC_TOKEN });
+
+    const result = await sender.checkChat();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).toContain('ENOTFOUND');
+  });
+
+  // The reason reaches both a log line and a Telegram message, and a fetch
+  // failure embeds the request URL — which carries the bot token.
+  it('scrubs the bot token out of a network error message', async () => {
+    const fetchMock = vi.fn(async () => {
+      throw new Error('request to https://api.telegram.org/botSECRET-TOKEN/getChat failed');
+    });
+    const sender = makeSender(fetchMock as unknown as typeof fetch, { token: 'SECRET-TOKEN' });
+
+    const result = await sender.checkChat();
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.reason).not.toContain('SECRET-TOKEN');
+      expect(result.reason).toContain('***');
+    }
+  });
+
+  it('scrubs the bot token out of an API description too', async () => {
+    const fetchMock = vi.fn(async () =>
+      jsonResponse(401, { ok: false, description: 'Unauthorized: SECRET-TOKEN rejected' })
+    );
+    const sender = makeSender(fetchMock as unknown as typeof fetch, { token: 'SECRET-TOKEN' });
+
+    const result = await sender.checkChat();
+    expect(result.ok).toBe(false);
+    if (!result.ok) expect(result.reason).not.toContain('SECRET-TOKEN');
+  });
+});

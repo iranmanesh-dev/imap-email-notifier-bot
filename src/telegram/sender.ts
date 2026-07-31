@@ -1,3 +1,5 @@
+import { scrubSecret } from '../scrub.js';
+
 export type SendOutcome = 'sent' | 'dropped';
 
 export type InlineButton = { text: string; callback_data: string };
@@ -25,6 +27,7 @@ function toPlainText(html: string): string {
 
 export class TelegramSender {
   readonly #baseUrl: string;
+  readonly #token: string;
   readonly #chatId: string;
   readonly #fetch: typeof fetch;
   readonly #sleep: (ms: number) => Promise<void>;
@@ -36,11 +39,50 @@ export class TelegramSender {
 
   constructor(opts: SenderOptions) {
     this.#baseUrl = `https://api.telegram.org/bot${opts.token}`;
+    this.#token = opts.token;
     this.#chatId = opts.chatId;
     this.#fetch = opts.fetchImpl ?? fetch;
     this.#sleep = opts.sleep ?? defaultSleep;
     this.#minIntervalMs = opts.minIntervalMs ?? 1100;
     this.#maxAttempts = opts.maxAttempts ?? 5;
+  }
+
+  /**
+   * Confirms the bot can actually reach the chat it sends to, and reports
+   * why not when it cannot.
+   *
+   * A wrong chat id is otherwise silent AND lossy. `send()` returns
+   * 'dropped' rather than throwing, `createEmailHandler` logs one line and
+   * resolves, and the sweeper marks the message seen on that resolution —
+   * so the email is gone for good with nothing in Telegram to say so.
+   * Asking once at startup turns a permanent silent loss into an immediate,
+   * actionable message.
+   *
+   * `getChat` proves the chat exists and the bot is in it, which covers the
+   * two mistakes that actually happen: a mistyped id, and a bot that was
+   * never added to the channel. It cannot prove posting rights — an admin
+   * whose "Post Messages" permission is off passes this check — so it is a
+   * boot-time smoke test, not a guarantee.
+   *
+   * Never throws: a failed preflight must not be able to stop the daemon
+   * from starting. The token is scrubbed from the reason because a fetch
+   * failure embeds the request URL, and the URL contains the token.
+   */
+  async checkChat(): Promise<{ ok: true } | { ok: false; reason: string }> {
+    try {
+      const res = await this.#fetch(`${this.#baseUrl}/getChat`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ chat_id: this.#chatId }),
+      });
+      if (res.ok) return { ok: true };
+      const payload = (await res.json().catch(() => ({}))) as { description?: string };
+      const reason = payload.description ?? `HTTP ${res.status}`;
+      return { ok: false, reason: scrubSecret(reason, this.#token) };
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      return { ok: false, reason: scrubSecret(reason, this.#token) };
+    }
   }
 
   /** Enqueues a message. Resolves once it is sent or definitively dropped. */
