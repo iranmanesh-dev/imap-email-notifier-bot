@@ -229,7 +229,8 @@ equivalent stop timeout yourself.
 | Variable | Required | Default | Meaning |
 |---|---|---|---|
 | `TELEGRAM_BOT_TOKEN` | yes | — | Bot token from BotFather |
-| `TELEGRAM_CHAT_ID` | yes | — | The only chat allowed to send commands |
+| `TELEGRAM_CHAT_ID` | yes | — | The only chat allowed to send commands; also where notifications go by default |
+| `TELEGRAM_NOTIFY_CHAT_ID` | no | `TELEGRAM_CHAT_ID` | Post notifications to a channel or group instead — see [Sending notifications to a channel](#sending-notifications-to-a-channel) |
 | `MASTER_KEY` | yes | — | ≥32 chars; encrypts stored mailbox passwords. `openssl rand -base64 32` |
 | `SWEEP_INTERVAL_SECONDS` | no | `60` | Non-INBOX folder check interval |
 | `PREVIEW_CHARS` | no | `200` | Body preview length |
@@ -239,6 +240,40 @@ equivalent stop timeout yourself.
 Invalid configuration (a missing required variable, or a `MASTER_KEY` shorter than 32
 characters) makes the process print `fatal: ...` to stderr and exit 1 immediately at
 boot — it never starts with a partially-valid configuration.
+
+### Sending notifications to a channel
+
+Set `TELEGRAM_NOTIFY_CHAT_ID` to a channel or group ID and mail is posted there instead,
+while `TELEGRAM_CHAT_ID` keeps doing its other job — the private chat you command the bot
+from.
+
+1. Create the channel and **add the bot as an administrator** with the *Post Messages*
+   permission. A bot cannot post to a channel it does not administer.
+2. Get the channel's ID: forward any message from the channel to
+   [@userinfobot](https://t.me/userinfobot), or post to the channel and read
+   `result[0].channel_post.chat.id` from
+   `https://api.telegram.org/bot<TOKEN>/getUpdates`. Channel IDs are negative and
+   usually look like `-1001234567890`. A public channel's `@name` works too.
+3. Set `TELEGRAM_NOTIFY_CHAT_ID` to that value and redeploy.
+
+**Keep `TELEGRAM_CHAT_ID` pointing at your private chat.** It is the command-authorization
+gate, not just a destination. Pointing it at a channel breaks every command — channel posts
+arrive as a different update type the bot does not accept — and would mean typing mailbox
+passwords into a channel.
+
+What goes where, once they differ:
+
+| | Destination |
+|---|---|
+| Email notifications | the channel |
+| Commands, buttons, the add wizard, password prompts | your private chat |
+| Account failure alerts (wrong password, retries exhausted) | your private chat |
+
+Alerts stay with you because you are the one who can act on them — a channel of readers
+cannot re-enter a password.
+
+Anyone who can read the channel sees every sender, subject and preview that lands in it, so
+treat channel membership as read access to your mail.
 
 ### Adding a mailbox
 

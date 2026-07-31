@@ -9,7 +9,15 @@ export type Account = {
 
 export type Config = {
   telegramBotToken: string;
+  /** The operator's chat: the only one allowed to command the bot. */
   telegramChatId: string;
+  /**
+   * Where email notifications are posted — a channel or group, when set.
+   * Defaults to `telegramChatId`. Kept separate because that one doubles as
+   * the command-authorization gate, so pointing it at a channel would both
+   * break every command and invite typing mailbox passwords into it.
+   */
+  telegramNotifyChatId: string;
   masterKey: string;
   sweepIntervalSeconds: number;
   previewChars: number;

@@ -26,6 +26,12 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   // sends 400 silently (wrong chat_id) while comparisons elsewhere failed
   // just as silently — two different bugs from one untrimmed env var.
   const telegramChatId = requireVar(env, 'TELEGRAM_CHAT_ID').trim();
+  // Optional, and trimmed the same way for the same reason. Empty or unset
+  // means "notify the operator", which is the single-chat setup everyone
+  // starts with; setting it routes mail to a channel or group while
+  // commands, the wizard and alerts stay in the operator's private chat.
+  const notifyOverride = (env.TELEGRAM_NOTIFY_CHAT_ID ?? '').trim();
+  const telegramNotifyChatId = notifyOverride.length > 0 ? notifyOverride : telegramChatId;
   const masterKey = requireVar(env, 'MASTER_KEY');
 
   if (masterKey.length < MIN_MASTER_KEY_LENGTH) {
@@ -37,6 +43,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
   return {
     telegramBotToken,
     telegramChatId,
+    telegramNotifyChatId,
     masterKey,
     sweepIntervalSeconds: numberVar(env, 'SWEEP_INTERVAL_SECONDS', 60),
     previewChars: numberVar(env, 'PREVIEW_CHARS', 200),

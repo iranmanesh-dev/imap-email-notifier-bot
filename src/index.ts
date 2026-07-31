@@ -496,7 +496,23 @@ async function main(): Promise<void> {
     chatId: config.telegramChatId,
   });
 
-  const onEmail = createEmailHandler(sender);
+  // Mail can be routed to a channel or group while every control surface —
+  // command replies, the add wizard, password prompts, fatal alerts — stays
+  // in the operator's private chat. A second instance rather than a
+  // per-call chat_id because the send queue and the 1.1s throttle are
+  // per-chat state: Telegram rate-limits each chat separately, so a burst
+  // of mail to the channel must not delay a wizard prompt to the operator.
+  // Identical chats share one instance, so the default setup keeps exactly
+  // one queue.
+  const notifier =
+    config.telegramNotifyChatId === config.telegramChatId
+      ? sender
+      : new TelegramSender({
+          token: config.telegramBotToken,
+          chatId: config.telegramNotifyChatId,
+        });
+
+  const onEmail = createEmailHandler(notifier);
 
   const onFatal = async (account: Account, message: string): Promise<void> => {
     // `message` is built entirely by AccountWatcher from the account label

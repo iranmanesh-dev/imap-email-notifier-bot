@@ -61,4 +61,29 @@ describe('loadConfig', () => {
     const cfg = loadConfig({ ...baseEnv, TELEGRAM_CHAT_ID: '  999  \n' });
     expect(cfg.telegramChatId).toBe('999');
   });
+
+  it('notifies the operator chat when no notify chat is set', () => {
+    const cfg = loadConfig({ ...baseEnv });
+    expect(cfg.telegramNotifyChatId).toBe('999');
+  });
+
+  it('routes notifications to a channel without changing the operator chat', () => {
+    const cfg = loadConfig({ ...baseEnv, TELEGRAM_NOTIFY_CHAT_ID: '-1001234567890' });
+    expect(cfg.telegramNotifyChatId).toBe('-1001234567890');
+    // The command gate must NOT follow the notification target, or setting a
+    // channel would hand command rights to it.
+    expect(cfg.telegramChatId).toBe('999');
+  });
+
+  it('trims surrounding whitespace from TELEGRAM_NOTIFY_CHAT_ID', () => {
+    const cfg = loadConfig({ ...baseEnv, TELEGRAM_NOTIFY_CHAT_ID: '  -100123  \n' });
+    expect(cfg.telegramNotifyChatId).toBe('-100123');
+  });
+
+  it('treats an empty or whitespace-only notify chat as unset', () => {
+    expect(loadConfig({ ...baseEnv, TELEGRAM_NOTIFY_CHAT_ID: '' }).telegramNotifyChatId).toBe('999');
+    expect(loadConfig({ ...baseEnv, TELEGRAM_NOTIFY_CHAT_ID: '   ' }).telegramNotifyChatId).toBe(
+      '999'
+    );
+  });
 });
