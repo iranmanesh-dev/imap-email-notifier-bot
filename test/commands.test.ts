@@ -547,4 +547,73 @@ describe('wizard typed steps', () => {
     await handleUpdate(msg('/list'), deps);
     expect(replies.some((r) => /cancel/i.test(r))).toBe(true);
   });
+
+  it('rejects a duplicate label at the label step, before a password is ever solicited', async () => {
+    // /add pre-checks the label. The wizard did not, so the operator walked
+    // all five steps, sent a password, had it deleted, and a real IMAP login
+    // ran — and only then did mailboxes.add throw "already exists".
+    const { deps, replies, deleted } = makeDeps();
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+
+    await handleUpdate(msg('Work'), deps);
+
+    expect(replies.at(-1)).toMatch(/already exists/i);
+    expect(replies.at(-1)).not.toMatch(/which imap host/i);
+    expect(deleted).toEqual([]);
+  });
+
+  it('stays on the label step after a duplicate, so another label can just be sent', async () => {
+    const { deps, replies } = makeDeps();
+    deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+    deps.conversations.set(OPERATOR, { kind: 'wizard-label', expiresAt: NOW + 60_000 });
+
+    await handleUpdate(msg('Work'), deps);
+    await handleUpdate(msg('Home'), deps);
+
+    expect(replies.at(-1)).toMatch(/which imap host/i);
+  });
+});
+
+describe('completing an add', () => {
+  function keyboardCapture() {
+    const keyboards: (InlineKeyboard | undefined)[] = [];
+    return {
+      keyboards,
+      reply: async (_text: string, keyboard?: InlineKeyboard) => { keyboards.push(keyboard); },
+    };
+  }
+
+  it('ends a successful add with a keyboard, so a button-driven add has a way back', async () => {
+    // The wizard's last two steps are typed, so a button-driven add lands in
+    // completeAdd. With no keyboard on the terminal message the operator is
+    // left with no way back into the menu.
+    const { reply, keyboards } = keyboardCapture();
+    const { deps } = makeDeps({ reply });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('s3cret', OPERATOR, 91), deps);
+    expect(keyboards.at(-1)).toBeDefined();
+  });
+
+  it('ends a failed add with a keyboard too', async () => {
+    const { reply, keyboards } = keyboardCapture();
+    const { deps } = makeDeps({ reply, probe: async () => ({ ok: false, reason: 'AUTHENTICATIONFAILED' }) });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('wrong-pw', OPERATOR, 92), deps);
+    expect(keyboards.at(-1)).toBeDefined();
+  });
+
+  it('ends a saved-but-unwatched add with a keyboard too', async () => {
+    const { reply, keyboards } = keyboardCapture();
+    const { deps } = makeDeps({
+      reply,
+      registry: {
+        add: async () => { throw new Error('watcher start failed'); },
+        remove: async () => false, has: () => false, states: () => [], size: () => 0,
+      } as unknown as CommandDeps['registry'],
+    });
+    await handleUpdate(msg('/add Work imap.example.com 993 me@example.com'), deps);
+    await handleUpdate(msg('s3cret', OPERATOR, 93), deps);
+    expect(keyboards.at(-1)).toBeDefined();
+  });
 });

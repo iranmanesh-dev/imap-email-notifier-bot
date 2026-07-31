@@ -125,6 +125,13 @@ export class TelegramSender {
    * Returns false rather than throwing. Telegram refuses to edit messages
    * older than 48 hours, so callers must fall back to sending a new message
    * — otherwise tapping a button on a day-old menu silently does nothing.
+   *
+   * True means "the message now displays this content", which is why a
+   * "message is not modified" 400 counts as success: Telegram rejects a
+   * no-op edit, but the requested state IS the displayed state. Reporting
+   * false there sent the caller down the new-message fallback, so
+   * double-tapping Back appended a duplicate menu every time. This is the
+   * only place that can tell the two 400s apart.
    */
   async editMessageText(
     chatId: string,
@@ -146,7 +153,9 @@ export class TelegramSender {
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
       });
-      return res.ok;
+      if (res.ok) return true;
+      const payload = (await res.json().catch(() => ({}))) as { description?: string };
+      return (payload.description ?? '').includes('message is not modified');
     } catch {
       return false;
     }

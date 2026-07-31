@@ -1,7 +1,7 @@
 import {
   CONFIRM_TTL_MS, PASSWORD_TTL_MS, WIZARD_TTL_MS, cancellationNotice, type Conversations,
 } from './conversation.js';
-import { hostPickKeyboard } from './keyboards.js';
+import { cancelKeyboard, hostPickKeyboard, menuKeyboard } from './keyboards.js';
 import { PLAIN_STATUS, buildStatusReport } from './status.js';
 import { scrubSecret } from '../scrub.js';
 import type { TelegramUpdate } from './receiver.js';
@@ -59,6 +59,21 @@ export async function handleUpdate(update: TelegramUpdate, deps: CommandDeps): P
   if (pending !== null) {
     if (!text.startsWith('/')) {
       if (pending.kind === 'wizard-label') {
+        // The same pre-check /add does, at the only step that can make it.
+        // Without it the operator walks all five steps, sends a password,
+        // has it deleted and a real IMAP login run — and only then does
+        // mailboxes.add throw "already exists", with nothing saved.
+        if (deps.mailboxes.labels().includes(text)) {
+          // Stay on the label step so another label can simply be sent.
+          deps.conversations.set(message.chat.id, {
+            kind: 'wizard-label', expiresAt: deps.now() + WIZARD_TTL_MS,
+          });
+          return deps.reply(
+            `A mailbox labelled "${text}" already exists. Send a different label, ` +
+              `or remove that one first.`,
+            cancelKeyboard()
+          );
+        }
         deps.conversations.set(message.chat.id, {
           kind: 'wizard-host', label: text, expiresAt: deps.now() + WIZARD_TTL_MS,
         });
@@ -193,6 +208,10 @@ async function completeAdd(
     secure: true,
   };
 
+  // Every terminal message below carries the menu. completeAdd is where a
+  // BUTTON-driven add lands (its last two steps are typed), so ending
+  // without a keyboard leaves the operator with no way back — while the
+  // spec says the menu is shown after any action completes.
   const result = await deps.probe(account);
   if (!result.ok) {
     // Scrubbed again here even though probeMailbox already scrubs its own
@@ -200,7 +219,8 @@ async function completeAdd(
     // where text actually leaves for Telegram — the last place that can
     // still guarantee it. Cheap, and it makes the guarantee local.
     return deps.reply(
-      `Could not connect, so nothing was saved.\n\n${scrubSecret(result.reason, password)}`
+      `Could not connect, so nothing was saved.\n\n${scrubSecret(result.reason, password)}`,
+      menuKeyboard()
     );
   }
 
@@ -208,7 +228,7 @@ async function completeAdd(
     deps.mailboxes.add(account);
   } catch (err) {
     // Failed before persisting anything — nothing to clean up.
-    return deps.reply(`Failed to save: ${scrubSecret(errorText(err), password)}`);
+    return deps.reply(`Failed to save: ${scrubSecret(errorText(err), password)}`, menuKeyboard());
   }
 
   try {
@@ -221,13 +241,15 @@ async function completeAdd(
       `Saved "${account.label}", but failed to start watching it: ` +
         `${scrubSecret(errorText(err), password)}\n` +
         `It is not being monitored. Run /remove "${account.label}" and add it again, ` +
-        `or restart the bot to retry starting the watcher.`
+        `or restart the bot to retry starting the watcher.`,
+      menuKeyboard()
     );
   }
 
   return deps.reply(
     `Connected — ${result.folders} folders. Saved "${account.label}" and now watching it.\n` +
-      `The first sweep records a baseline, so you'll be notified from the next email onward.`
+      `The first sweep records a baseline, so you'll be notified from the next email onward.`,
+    menuKeyboard()
   );
 }
 

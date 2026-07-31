@@ -337,13 +337,30 @@ describe('keyboards and callbacks', () => {
     expect(await sender.editMessageText('42', 7, 'x')).toBe(false);
   });
 
-  it('never puts the bot token in a returned value', async () => {
-    const sender = new TelegramSender({
-      token: 'SECRETTOKEN', chatId: '42',
-      fetchImpl: (async () => { throw new Error('boom'); }) as unknown as typeof fetch,
-      sleep: async () => {}, minIntervalMs: 0,
-    });
-    expect(String(await sender.answerCallbackQuery('x'))).not.toContain('SECRETTOKEN');
-    expect(String(await sender.editMessageText('42', 1, 'x'))).not.toContain('SECRETTOKEN');
+  it('editMessageText reports success when Telegram says the message is not modified', async () => {
+    // Telegram 400s a no-op edit with "message is not modified". Treating
+    // that like "too old" made callbacks.ts's show() fall back to POSTING A
+    // NEW MESSAGE, so double-tapping Back appended a duplicate menu every
+    // time. The requested state IS the displayed state here, so this is a
+    // success — the one 400 that must not reach the fallback.
+    const sender = makeSender(
+      (async () =>
+        jsonResponse(400, {
+          ok: false,
+          error_code: 400,
+          description: 'Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message',
+        })) as unknown as typeof fetch
+    );
+    expect(await sender.editMessageText('42', 7, 'x')).toBe(true);
   });
+
+  // Removed: a "never puts the bot token in a returned value" test used to
+  // live here. It asserted String(await sender.answerCallbackQuery('x'))
+  // does not contain the token — but that stringifies a BOOLEAN, so it could
+  // never fail for any implementation, while its name implied token leakage
+  // was covered. No public method on TelegramSender returns anything but a
+  // boolean or a SendOutcome, so there is no return-value leak path to
+  // exercise; the token appears only in #baseUrl, which is never surfaced.
+  // A test that cannot fail is worse than no test: it stops the next reader
+  // from writing a real one.
 });

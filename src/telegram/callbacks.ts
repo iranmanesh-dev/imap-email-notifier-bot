@@ -22,7 +22,11 @@ export type CallbackDeps = {
   registry: WatcherRegistry;
   conversations: Conversations;
   probe: (account: Account) => Promise<ProbeResult>;
-  answer: (callbackQueryId: string, text?: string) => Promise<boolean>;
+  // No `text` parameter: Telegram's optional toast was never populated by
+  // any call site, and a parameter nothing supplies reads as a feature that
+  // exists. TelegramSender.answerCallbackQuery still accepts one if a toast
+  // is ever actually wanted.
+  answer: (callbackQueryId: string) => Promise<boolean>;
   edit: (messageId: number, html: string, keyboard?: InlineKeyboard) => Promise<boolean>;
   reply: (html: string, keyboard?: InlineKeyboard) => Promise<void>;
   now: () => number;
@@ -35,6 +39,14 @@ const MENU_TEXT = '📬 <b>Mailboxes</b>\nChoose an action.';
  *
  * Telegram refuses to edit messages older than 48 hours, so without the
  * fallback a button tapped on a day-old menu would silently do nothing.
+ *
+ * `deps.edit` must therefore report true whenever the message now DISPLAYS
+ * the requested content — not merely when an edit was performed. Telegram
+ * 400s a no-op edit with "message is not modified", and treating that as a
+ * refusal made double-tapping Back append a duplicate menu every time.
+ * Only the sender can see that description, so the distinction is made
+ * there (see TelegramSender.editMessageText) and the contract is stated
+ * here, where the fallback depends on it.
  */
 async function show(
   deps: CallbackDeps,
@@ -67,12 +79,18 @@ export async function handleCallback(update: TelegramUpdate, deps: CallbackDeps)
   const messageId = query.message?.message_id;
   try {
     const action = query.data === undefined ? null : decodeAction(query.data);
-    await cancelPendingUnlessOwned(action, deps);
+    // `chatId` is threaded through from the tapped message rather than
+    // re-derived from deps.operatorChatId, for the reason commands.ts gives
+    // at startAdd: conversations are read back with message.chat.id, so
+    // keying them on Number(operatorChatId) was only correct indirectly —
+    // via the chat-id gate above — and any drift between the two
+    // representations would silently strand every pending flow.
+    await cancelPendingUnlessOwned(action, deps, chatId);
     if (action === null) {
       await renderMenu(deps, messageId);
       return;
     }
-    await dispatch(action, deps, messageId);
+    await dispatch(action, deps, chatId, messageId);
   } catch (err) {
     console.error(`[telegram] callback failed: ${errorText(err)}`);
   } finally {
@@ -135,10 +153,11 @@ function ownsPendingFlow(action: CallbackAction | null): boolean {
  */
 async function cancelPendingUnlessOwned(
   action: CallbackAction | null,
-  deps: CallbackDeps
+  deps: CallbackDeps,
+  chatId: number
 ): Promise<void> {
   if (ownsPendingFlow(action)) return;
-  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) return;
   await deps.reply(escapeHtml(cancellationNotice(pending)));
 }
@@ -146,6 +165,7 @@ async function cancelPendingUnlessOwned(
 async function dispatch(
   action: CallbackAction,
   deps: CallbackDeps,
+  chatId: number,
   messageId: number | undefined
 ): Promise<void> {
   switch (action.kind) {
@@ -160,18 +180,18 @@ async function dispatch(
     case 'test-pick':
       return showPicker(deps, messageId, 'test');
     case 'add':
-      return startWizard(deps, messageId);
+      return startWizard(deps, chatId, messageId);
     case 'cancel':
-      deps.conversations.clear(Number(deps.operatorChatId));
+      deps.conversations.clear(chatId);
       return renderMenu(deps, messageId);
     case 'host':
-      return applyHost(deps, messageId, action.value);
+      return applyHost(deps, chatId, messageId, action.value);
     case 'port':
-      return applyPort(deps, messageId, action.value);
+      return applyPort(deps, chatId, messageId, action.value);
     case 'type-host':
-      return promptTyped(deps, messageId, 'wizard-host', 'Send the IMAP host as your next message.');
+      return promptTyped(deps, chatId, messageId, 'wizard-host', 'Send the IMAP host as your next message.');
     case 'type-port':
-      return promptTyped(deps, messageId, 'wizard-port', 'Send the port number as your next message.');
+      return promptTyped(deps, chatId, messageId, 'wizard-port', 'Send the port number as your next message.');
     case 'remove':
       return confirmRemove(deps, messageId, action.token);
     case 'remove-confirm':
@@ -184,18 +204,48 @@ async function dispatch(
 }
 
 /**
+ * Reads the saved labels, or reports why it could not.
+ *
+ * labels() hits SQLite and can throw. Unguarded, that throw lands in
+ * handleCallback's catch — which logs, clears the spinner and says nothing,
+ * leaving the operator with a button that visibly did nothing at all. Same
+ * guard buildStatusReport applies for the same call.
+ */
+async function readLabels(
+  deps: CallbackDeps,
+  messageId: number | undefined
+): Promise<string[] | null> {
+  try {
+    return deps.mailboxes.labels();
+  } catch (err) {
+    await show(
+      deps,
+      messageId,
+      `Could not read the saved mailbox list: ${escapeHtml(errorText(err))}`,
+      menuKeyboard()
+    );
+    return null;
+  }
+}
+
+/**
  * Resolves a token to a live label, or reports a stale button.
  *
  * Telegram keeps old messages tappable indefinitely, so a button referring
  * to a since-deleted mailbox is normal, not exceptional. A callback is never
  * treated as evidence that its target still exists.
+ *
+ * A null return means "do not act": either the mailbox is gone, or the list
+ * could not be read at all. Both have already been reported.
  */
 async function resolveOrReport(
   deps: CallbackDeps,
   messageId: number | undefined,
   token: string
 ): Promise<string | null> {
-  const label = resolveToken(token, deps.mailboxes.labels());
+  const labels = await readLabels(deps, messageId);
+  if (labels === null) return null;
+  const label = resolveToken(token, labels);
   if (label === null) {
     await show(deps, messageId, 'That mailbox no longer exists.', menuKeyboard());
   }
@@ -319,8 +369,12 @@ async function doTest(
   await show(deps, messageId, text, backKeyboard());
 }
 
-export async function startWizard(deps: CallbackDeps, messageId: number | undefined): Promise<void> {
-  deps.conversations.set(Number(deps.operatorChatId), {
+export async function startWizard(
+  deps: CallbackDeps,
+  chatId: number,
+  messageId: number | undefined
+): Promise<void> {
+  deps.conversations.set(chatId, {
     kind: 'wizard-label',
     expiresAt: deps.now() + WIZARD_TTL_MS,
   });
@@ -338,10 +392,11 @@ export async function startWizard(deps: CallbackDeps, messageId: number | undefi
  */
 async function applyHost(
   deps: CallbackDeps,
+  chatId: number,
   messageId: number | undefined,
   host: string
 ): Promise<void> {
-  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) {
     return renderMenu(deps, messageId);
   }
@@ -350,10 +405,10 @@ async function applyHost(
     // wizard at all) is pending must not destroy that other step. take()
     // already removed it above, so put it back exactly as it was before
     // falling through to the menu.
-    deps.conversations.set(Number(deps.operatorChatId), pending);
+    deps.conversations.set(chatId, pending);
     return renderMenu(deps, messageId);
   }
-  deps.conversations.set(Number(deps.operatorChatId), {
+  deps.conversations.set(chatId, {
     kind: 'wizard-port',
     label: pending.label,
     host,
@@ -364,20 +419,21 @@ async function applyHost(
 
 async function applyPort(
   deps: CallbackDeps,
+  chatId: number,
   messageId: number | undefined,
   port: number
 ): Promise<void> {
-  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) {
     return renderMenu(deps, messageId);
   }
   if (pending.kind !== 'wizard-port') {
     // Same reasoning as applyHost: a stray port tap must not destroy a
     // different pending step. Restore what was actually there.
-    deps.conversations.set(Number(deps.operatorChatId), pending);
+    deps.conversations.set(chatId, pending);
     return renderMenu(deps, messageId);
   }
-  deps.conversations.set(Number(deps.operatorChatId), {
+  deps.conversations.set(chatId, {
     kind: 'wizard-username',
     label: pending.label,
     host: pending.host,
@@ -411,13 +467,14 @@ async function applyPort(
  */
 async function promptTyped(
   deps: CallbackDeps,
+  chatId: number,
   messageId: number | undefined,
   step: 'wizard-host' | 'wizard-port',
   prompt: string
 ): Promise<void> {
-  const pending = deps.conversations.take(Number(deps.operatorChatId), deps.now());
+  const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) return renderMenu(deps, messageId);
-  deps.conversations.set(Number(deps.operatorChatId), pending);
+  deps.conversations.set(chatId, pending);
   if (pending.kind !== step) return renderMenu(deps, messageId);
   await show(deps, messageId, prompt, cancelKeyboard());
 }
@@ -456,7 +513,8 @@ async function showPicker(
   messageId: number | undefined,
   target: 'remove' | 'test'
 ): Promise<void> {
-  const labels = deps.mailboxes.labels();
+  const labels = await readLabels(deps, messageId);
+  if (labels === null) return;
   if (labels.length === 0) {
     return show(deps, messageId, 'No mailboxes configured yet.', menuKeyboard());
   }

@@ -27,7 +27,7 @@ function tap(data: string, chatId = OPERATOR, messageId = 5): TelegramUpdate {
 function makeDeps(overrides: Partial<CallbackDeps> = {}) {
   const stored = new Map<string, Account>();
   const running = new Set<string>();
-  const answers: [string, string | undefined][] = [];
+  const answers: string[] = [];
   const edits: string[] = [];
   const editKeyboards: (InlineKeyboard | undefined)[] = [];
   const replies: string[] = [];
@@ -55,7 +55,7 @@ function makeDeps(overrides: Partial<CallbackDeps> = {}) {
     } as unknown as CallbackDeps['registry'],
     conversations: new Conversations(),
     probe: async (a: Account) => { probes.push(a.label); return { ok: true, folders: 4 }; },
-    answer: async (id: string, text?: string) => { answers.push([id, text]); return true; },
+    answer: async (id: string) => { answers.push(id); return true; },
     edit: async (_id: number, html: string, keyboard?: InlineKeyboard) => {
       edits.push(html);
       editKeyboards.push(keyboard);
@@ -137,13 +137,13 @@ describe('answering', () => {
   it('answers the callback query on a normal action', async () => {
     const { deps, answers } = makeDeps();
     await handleCallback(tap('m'), deps);
-    expect(answers.map((a) => a[0])).toEqual(['cbq-1']);
+    expect(answers).toEqual(['cbq-1']);
   });
 
   it('answers even when the action is unrecognised', async () => {
     const { deps, answers } = makeDeps();
     await handleCallback(tap('zzz'), deps);
-    expect(answers.map((a) => a[0])).toEqual(['cbq-1']);
+    expect(answers).toEqual(['cbq-1']);
   });
 
   it('answers even when the handler throws', async () => {
@@ -152,7 +152,7 @@ describe('answering', () => {
       reply: async () => { throw new Error('boom'); },
     });
     await expect(handleCallback(tap('m'), deps)).resolves.toBeUndefined();
-    expect(answers.map((a) => a[0])).toEqual(['cbq-1']);
+    expect(answers).toEqual(['cbq-1']);
   });
 });
 
@@ -597,6 +597,40 @@ describe('remove and test', () => {
     expect(removeActions.map((a) => (a as { token: string }).token).sort()).toEqual(
       [labelToken('Home'), labelToken('Work')].sort()
     );
+  });
+
+  it('a mailbox-list read failure while resolving a token is reported, not swallowed', async () => {
+    // resolveToken needs labels(). Unguarded, a SQLite failure threw into
+    // handleCallback's catch: the spinner cleared and the operator got
+    // nothing at all — indistinguishable from a dead bot.
+    const { deps, edits } = makeDeps();
+    seed(deps, 'Work');
+    const token = labelToken('Work');
+    deps.mailboxes.labels = () => {
+      throw new Error('database is locked');
+    };
+    await handleCallback(tap(encodeAction({ kind: 'remove', token })), deps);
+    expect(edits.at(-1)).toMatch(/database is locked/);
+  });
+
+  it('a mailbox-list read failure while building a picker is reported, not swallowed', async () => {
+    const { deps, edits } = makeDeps();
+    deps.mailboxes.labels = () => {
+      throw new Error('database is locked');
+    };
+    await handleCallback(tap('rp'), deps);
+    expect(edits.at(-1)).toMatch(/database is locked/);
+  });
+
+  it('never acts on a mailbox when the label list could not be read', async () => {
+    const { deps, stored } = makeDeps();
+    seed(deps, 'Work');
+    deps.mailboxes.labels = () => {
+      throw new Error('database is locked');
+    };
+    await handleCallback(tap(encodeAction({ kind: 'remove-confirm', token: labelToken('Work') })), deps);
+    expect(stored.size).toBe(1);
+    expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
   });
 
   it('test runs the probe and reports success', async () => {
