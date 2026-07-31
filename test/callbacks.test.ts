@@ -500,6 +500,78 @@ describe('a button tap arriving mid-flow', () => {
   });
 });
 
+describe('a stale quick-pick tapped while a DANGEROUS flow is pending', () => {
+  // The four quick-picks consume their own step, so they are exempt from the
+  // blanket cancel-on-tap rule. On a kind mismatch they restore what they
+  // found — right for a wizard-* step (the operator's flow is live and losing
+  // their place would be worse), but for a `password` or `remove-confirm`
+  // entry restoring reproduces the exact Critical this wave exists to close:
+  // the operator is shown a menu while a password prompt stays armed.
+  const QUICK_PICKS = ['h:imap.x.com', 'p:993', 'xh', 'xp'];
+
+  for (const data of QUICK_PICKS) {
+    it(`'${data}' cancels a pending password prompt instead of restoring it`, async () => {
+      const { deps, replies } = makeDeps();
+      const { commandDeps, deleted, probes } = makeCommandDeps(deps);
+      deps.conversations.set(OPERATOR, {
+        kind: 'password', label: 'Work', host: 'imap.gmail.com', port: 993,
+        username: 'me@gmail.com', expiresAt: NOW + PASSWORD_TTL_MS,
+      });
+
+      await handleCallback(tap(data), deps);
+
+      expect(replies.some((r) => /cancel/i.test(r) && /Work/.test(r))).toBe(true);
+
+      // The assertion that proves the Critical is actually closed rather
+      // than merely announced.
+      await handleUpdate(typed('just chatting'), commandDeps);
+      expect(deleted).toEqual([]);
+      expect(probes).toEqual([]);
+      expect(deps.conversations.size()).toBe(0);
+    });
+
+    it(`'${data}' cancels a pending removal confirmation instead of restoring it`, async () => {
+      const { deps, replies, stored } = makeDeps();
+      const { commandDeps } = makeCommandDeps(deps);
+      deps.mailboxes.add({ label: 'Work', host: 'h', port: 993, user: 'u', pass: 'p', secure: true });
+      deps.conversations.set(OPERATOR, {
+        kind: 'remove-confirm', label: 'Work', expiresAt: NOW + CONFIRM_TTL_MS,
+      });
+
+      await handleCallback(tap(data), deps);
+      expect(replies.some((r) => /cancel/i.test(r) && /Work/.test(r))).toBe(true);
+
+      await handleUpdate(typed('yes'), commandDeps);
+      expect(stored.size).toBe(1);
+      expect(deps.seen.purgeAccount).not.toHaveBeenCalled();
+    });
+  }
+
+  it('still RESTORES a mismatched wizard step, which is live and must not be lost', async () => {
+    // The other half of the rule. A stale host tap mid-port-step keeps the
+    // operator's place, and says nothing about cancelling anything.
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-port', label: 'Work', host: 'h', expiresAt: NOW + 60_000 });
+
+    await handleCallback(tap('h:imap.x.com'), deps);
+
+    expect(replies.filter((r) => /cancelled the pending/i.test(r))).toEqual([]);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored).toMatchObject({ kind: 'wizard-port', label: 'Work', host: 'h' });
+  });
+
+  it('a stale type-port tap keeps a live host step rather than cancelling it', async () => {
+    const { deps, replies } = makeDeps();
+    deps.conversations.set(OPERATOR, { kind: 'wizard-host', label: 'Work', expiresAt: NOW + 60_000 });
+
+    await handleCallback(tap('xp'), deps);
+
+    expect(replies.filter((r) => /cancelled the pending/i.test(r))).toEqual([]);
+    const restored = deps.conversations.take(OPERATOR, NOW);
+    expect(restored).toMatchObject({ kind: 'wizard-host', label: 'Work' });
+  });
+});
+
 describe('remove and test', () => {
   function seed(deps: CallbackDeps, label: string) {
     deps.mailboxes.add({ label, host: 'h', port: 993, user: 'u', pass: 'p', secure: true });

@@ -5,7 +5,9 @@ import {
 } from './keyboards.js';
 import type { InlineKeyboard } from './sender.js';
 import type { TelegramUpdate } from './receiver.js';
-import { WIZARD_TTL_MS, cancellationNotice, type Conversations } from './conversation.js';
+import {
+  WIZARD_TTL_MS, cancellationNotice, type Conversations, type Pending,
+} from './conversation.js';
 import type { MailboxStore } from '../store/mailboxes.js';
 import type { SeenStore } from '../store/seen.js';
 import type { WatcherRegistry } from '../imap/registry.js';
@@ -160,6 +162,37 @@ async function cancelPendingUnlessOwned(
   const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) return;
   await deps.reply(escapeHtml(cancellationNotice(pending)));
+}
+
+/**
+ * Puts back a pending entry a quick-pick consumed but did not match — or
+ * cancels it, when putting it back would be dangerous.
+ *
+ * The four quick-picks are exempt from the blanket cancel-on-tap rule
+ * because they consume their own step, so they alone decide what happens to
+ * a MISMATCHED entry. That decision differs by kind:
+ *
+ * - `wizard-*`: restore it. The operator's setup is live, they tapped a
+ *   button on a stale message, and destroying their place would be the
+ *   worse failure. Restored unchanged, so a tap cannot extend its TTL.
+ * - `password` / `remove-confirm`: cancel it, with the shared notice.
+ *   Restoring these reproduces the exact Critical this file was fixed for:
+ *   the operator is shown a menu — every cue saying the context moved on —
+ *   while a password prompt stays armed, so their next ordinary message is
+ *   deleted from Telegram and transmitted as a password to a real IMAP
+ *   server. A live wizard step is worth protecting; an armed password
+ *   prompt behind a menu screen is not.
+ */
+async function restoreOrCancel(
+  deps: CallbackDeps,
+  chatId: number,
+  pending: Pending
+): Promise<void> {
+  if (pending.kind === 'password' || pending.kind === 'remove-confirm') {
+    await deps.reply(escapeHtml(cancellationNotice(pending)));
+    return;
+  }
+  deps.conversations.set(chatId, pending);
 }
 
 async function dispatch(
@@ -401,11 +434,10 @@ async function applyHost(
     return renderMenu(deps, messageId);
   }
   if (pending.kind !== 'wizard-host') {
-    // A stray tap on a stale host button while a DIFFERENT step (or no
-    // wizard at all) is pending must not destroy that other step. take()
-    // already removed it above, so put it back exactly as it was before
-    // falling through to the menu.
-    deps.conversations.set(chatId, pending);
+    // A stray tap on a stale host button while a DIFFERENT step is pending
+    // must not destroy that step — but must not silently keep an armed
+    // password prompt alive behind a menu either. See restoreOrCancel.
+    await restoreOrCancel(deps, chatId, pending);
     return renderMenu(deps, messageId);
   }
   deps.conversations.set(chatId, {
@@ -428,9 +460,8 @@ async function applyPort(
     return renderMenu(deps, messageId);
   }
   if (pending.kind !== 'wizard-port') {
-    // Same reasoning as applyHost: a stray port tap must not destroy a
-    // different pending step. Restore what was actually there.
-    deps.conversations.set(chatId, pending);
+    // Same reasoning as applyHost.
+    await restoreOrCancel(deps, chatId, pending);
     return renderMenu(deps, messageId);
   }
   deps.conversations.set(chatId, {
@@ -474,8 +505,11 @@ async function promptTyped(
 ): Promise<void> {
   const pending = deps.conversations.take(chatId, deps.now());
   if (pending === null) return renderMenu(deps, messageId);
+  if (pending.kind !== step) {
+    await restoreOrCancel(deps, chatId, pending);
+    return renderMenu(deps, messageId);
+  }
   deps.conversations.set(chatId, pending);
-  if (pending.kind !== step) return renderMenu(deps, messageId);
   await show(deps, messageId, prompt, cancelKeyboard());
 }
 
