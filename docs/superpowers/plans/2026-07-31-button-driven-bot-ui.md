@@ -1079,7 +1079,7 @@ Expected: FAIL — cannot resolve `../src/telegram/callbacks.js`.
 
 ```ts
 import {
-  backKeyboard, decodeAction, mailboxKeyboard, menuKeyboard, resolveToken,
+  backKeyboard, decodeAction, mailboxKeyboard, menuKeyboard,
   type CallbackAction,
 } from './keyboards.js';
 import type { InlineKeyboard } from './sender.js';
@@ -1218,10 +1218,9 @@ function errorText(err: unknown): string {
 }
 ```
 
-`resolveToken` is imported for Tasks 6 and 7; TypeScript will flag it as unused until then.
-Leave the import in place and add `// eslint-disable-next-line` only if a linter complains —
-this project has no linter configured, and `tsc` does not error on unused imports with the
-current `tsconfig.json`.
+Do NOT import `resolveToken` yet — nothing in this task uses it, and an unused import is
+dead code a reviewer will rightly flag. Task 7 adds it when the remove and test flows need
+it.
 
 - [ ] **Step 4: Run the test to verify it passes**
 
@@ -1624,7 +1623,7 @@ Expected: FAIL — remove and test actions fall through to the menu.
 
 - [ ] **Step 3: Implement the flows in `src/telegram/callbacks.ts`**
 
-Import `confirmRemoveKeyboard` from `./keyboards.js`. Replace `dispatch`'s `default`
+Add `confirmRemoveKeyboard` and `resolveToken` to the existing `./keyboards.js` import. Replace `dispatch`'s `default`
 branch with explicit cases:
 
 ```ts
